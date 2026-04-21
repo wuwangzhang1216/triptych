@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "paths": {
+      "src/*": ["./src/*"]
+    },
+    "types": ["bun-types"]
+  },
+  "include": ["src/**/*"]
+}
