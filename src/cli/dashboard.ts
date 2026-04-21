@@ -1,25 +1,33 @@
 /**
- * Dashboard — a live multi-row status board that updates in place during a
- * phase. One row per concurrent worker (provider, or reviewer→target pair in
- * R2), showing: spinner / checkmark, label, status, elapsed, char count.
+ * Dashboard — live multi-row status board that updates in place during a
+ * phase. One row per concurrent worker, rendered as a single column-aligned
+ * line:
  *
- * Rendering is throttled: a 120ms ticker advances the spinner frame and
- * re-renders. Token updates mutate internal counters cheaply; the ticker
- * does the actual draw so a burst of 500 delta chunks doesn't repaint 500×.
+ *     ⠋  claude          7.4s     1.2K
+ *     ✓  codex          14.3s     3.2K
+ *     ·  oai             queued
  *
- * When stdout is not a TTY (piped output, CI), the Dashboard degrades to
- * a plain "event log" — each state transition is written as one line
- * without any cursor control.
+ * Design:
+ * - Single glyph carries all state (spinner / check / cross / bullet). No
+ *   redundant "streaming"/"done"/"failed" word.
+ * - Numeric columns right-aligned to fixed widths so values line up vertically.
+ * - 120ms ticker advances the spinner and re-renders; token deltas mutate
+ *   counters cheaply, the ticker does the draw.
+ * - Non-TTY degrades to one line per state transition (no cursor motion).
  */
 
 import {
   dim,
+  displayWidth,
+  err,
   formatChars,
   formatElapsed,
-  green,
+  GLYPH,
   hideCursor,
   IS_TTY,
-  red,
+  ok,
+  padLeft,
+  padRight,
   showCursor,
 } from './ui.js'
 
@@ -28,18 +36,22 @@ const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '
 const UP = (n: number) => `\x1B[${n}A`
 const CLEAR_LINE = '\x1B[2K\r'
 
-type RowStatus = 'running' | 'done' | 'failed'
+type RowStatus = 'pending' | 'running' | 'done' | 'failed'
 
 interface Row {
   key: string
-  label: string           // pre-colored label text shown to user
+  label: string          // pre-rendered label (may contain ANSI); raw width tracked separately
+  rawWidth: number
   status: RowStatus
-  startedAt: number
+  startedAt?: number
   finishedAt?: number
   chars: number
-  extra?: string          // e.g. reviewer→target decoration
   message?: string
 }
+
+const LABEL_MIN = 10
+const ELAPSED_W = 7
+const CHARS_W = 6
 
 export class Dashboard {
   private rows = new Map<string, Row>()
@@ -66,19 +78,19 @@ export class Dashboard {
     this.rows.set(key, {
       key,
       label,
+      rawWidth: displayWidth(label),
       status: 'running',
       startedAt: Date.now(),
       chars: 0,
     })
     this.order.push(key)
     if (!IS_TTY) {
-      console.log(`  ${dim('⋯')} ${label} ${dim('started')}`)
+      process.stdout.write(`    ${dim('·')}  ${label}\n`)
     } else {
       this.render()
     }
   }
 
-  /** Add to the char counter for a row. Rendering is handled by the ticker. */
   incrementChars(key: string, delta: number): void {
     const r = this.rows.get(key)
     if (!r || r.status !== 'running') return
@@ -92,8 +104,8 @@ export class Dashboard {
     r.finishedAt = Date.now()
     if (typeof finalChars === 'number') r.chars = finalChars
     if (!IS_TTY) {
-      const el = formatElapsed((r.finishedAt ?? 0) - r.startedAt)
-      console.log(`  ${green('✓')} ${r.label} ${dim(`${el} · ${formatChars(r.chars)}`)}`)
+      const el = formatElapsed((r.finishedAt ?? 0) - (r.startedAt ?? 0))
+      process.stdout.write(`    ${ok('✓')}  ${r.label}  ${dim(el)}  ${dim(formatChars(r.chars))}\n`)
     } else {
       this.render()
     }
@@ -106,13 +118,20 @@ export class Dashboard {
     r.finishedAt = Date.now()
     r.message = message
     if (!IS_TTY) {
-      console.log(`  ${red('✗')} ${r.label} ${red(message)}`)
+      process.stdout.write(`    ${err('×')}  ${r.label}  ${err(truncate(message, 60))}\n`)
     } else {
       this.render()
     }
   }
 
-  /** Stop the ticker, repaint once with the final frame, release the cursor. */
+  /** Mark any rows still running as failed. Call before finalize() on error. */
+  failAllRunning(message: string): void {
+    for (const r of this.rows.values()) {
+      if (r.status === 'running') this.markFailed(r.key, message)
+    }
+  }
+
+  /** Stop the ticker, paint one final frame, restore the cursor. */
   finalize(): void {
     if (this.ticker) clearInterval(this.ticker)
     this.ticker = undefined
@@ -121,7 +140,7 @@ export class Dashboard {
     this.running = false
   }
 
-  /** Prepare for the next phase. Keeps prior output on screen; zeroes state. */
+  /** Prepare for the next phase. Keeps the prior output on screen. */
   reset(): void {
     this.rows.clear()
     this.order = []
@@ -131,7 +150,8 @@ export class Dashboard {
 
   private render(): void {
     if (!IS_TTY) return
-    const lines = this.order.map(k => this.formatRow(this.rows.get(k)!))
+    const labelCol = Math.max(LABEL_MIN, ...this.order.map(k => this.rows.get(k)!.rawWidth))
+    const lines = this.order.map(k => this.formatRow(this.rows.get(k)!, labelCol))
     let out = ''
     if (this.lastHeight > 0) out += UP(this.lastHeight)
     for (const line of lines) out += CLEAR_LINE + line + '\n'
@@ -139,27 +159,29 @@ export class Dashboard {
     this.lastHeight = lines.length
   }
 
-  private formatRow(r: Row): string {
-    const elapsed = formatElapsed((r.finishedAt ?? Date.now()) - r.startedAt)
+  private formatRow(r: Row, labelCol: number): string {
     let glyph: string
-    let statusText: string
-    if (r.status === 'running') {
-      glyph = dim(FRAMES[this.frame]!)
-      statusText = dim('streaming')
-    } else if (r.status === 'done') {
-      glyph = green('✓')
-      statusText = green('done')
-    } else {
-      glyph = red('✗')
-      statusText = red('failed')
-    }
-    // Pad the raw (uncolored) label to align columns; label passed in has color codes.
-    const labelRendered = r.label
-    const tail: string[] = []
-    tail.push(dim(elapsed))
-    if (r.chars > 0) tail.push(dim(formatChars(r.chars)))
-    if (r.message) tail.push(red(truncate(r.message, 60)))
-    return `  ${glyph}  ${labelRendered}  ${statusText}  ${tail.join(dim(' · '))}`
+    if (r.status === 'running')      glyph = dim(FRAMES[this.frame]!)
+    else if (r.status === 'done')    glyph = GLYPH.check
+    else if (r.status === 'failed')  glyph = GLYPH.fail
+    else                             glyph = GLYPH.pending
+
+    const label = padRight(r.label, labelCol)
+
+    const elapsedMs = (r.finishedAt ?? Date.now()) - (r.startedAt ?? Date.now())
+    const elapsedStr = r.status === 'pending' ? '' : formatElapsed(elapsedMs)
+    const elapsed = padLeft(dim(elapsedStr), ELAPSED_W)
+
+    // Only show chars once we have real data; blank during pending and
+    // early-streaming avoids a noisy "0" flash.
+    const charsStr = r.chars > 0 ? formatChars(r.chars) : ''
+    const chars = padLeft(dim(charsStr), CHARS_W)
+
+    const msg = r.status === 'failed' && r.message
+      ? `  ${err(truncate(r.message, 60))}`
+      : ''
+
+    return `    ${glyph}  ${label}  ${elapsed}  ${chars}${msg}`
   }
 }
 
