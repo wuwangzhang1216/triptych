@@ -116,7 +116,7 @@ Three concrete providers, one shared `PlanningProvider` interface:
 
 ```ts
 interface PlanningProvider {
-  readonly name: 'claude' | 'codex' | 'openrouter'
+  readonly name: 'claude' | 'codex' | 'oai'
   readonly model: string
   isAuthenticated(): Promise<boolean>
 
@@ -146,13 +146,15 @@ Providers are black boxes to the orchestrator. They can be upgraded from LLM to 
 - **Model whitelist**: `gpt-5.4`, `gpt-5.4-mini`, `gpt-4.1`, `gpt-4o` work; `o3` is rejected ("not supported when using Codex with a ChatGPT account")
 - SDK: OpenAI's official SDK does **not** work here — the endpoint is non-public and has a bespoke response schema. We hand-roll the SSE parser.
 
-### OpenRouter (API key)
+### OAI — any OpenAI-compatible endpoint (API key)
 
-- Endpoint: `https://openrouter.ai/api/v1/chat/completions`
-- Auth: OpenRouter API key
-- SDK: `openai` SDK pointed at OpenRouter's base URL — fully Chat-Completions compatible.
-- Web search: add `:online` suffix to the model id (e.g. `minimax/minimax-m2.7:online`)
-- Default model: `minimax/minimax-m2.7` — any OpenRouter model is drop-in.
+- Endpoint: `oai_base_url` + `/chat/completions`. Default `https://openrouter.ai/api/v1`.
+- Auth: `oai_api_key` — whatever key the configured endpoint expects.
+- SDK: the official `openai` SDK with `baseURL` overridden — every OpenAI-Chat-Completions-compatible provider works unchanged. Switching provider = changing two config values (`oai_base_url` + `oai_model`).
+- Supported out of the box via `pj config preset <name>`: OpenRouter (default), DeepSeek, Moonshot/Kimi, Zhipu/GLM (Z.AI + bigmodel.cn), DashScope/Qwen, MiniMax, Groq, Mistral, xAI Grok, Together, Fireworks, Cerebras, DeepInfra, SiliconFlow, Doubao (Volcengine), Perplexity, OpenAI direct.
+- OpenRouter-specific behaviors (`HTTP-Referer`/`X-Title` headers, `:online` web-search suffix) are gated on the configured base URL and are **not** sent to other endpoints — stricter gateways would otherwise reject unknown headers or model suffixes.
+- Default model on OpenRouter: `minimax/minimax-m2.7`. Presets swap this to a sensible default for each provider.
+- Legacy `openrouter_*` config keys and the `openrouter` provider/judge name are still accepted as aliases for back-compat.
 
 ## Agent mode
 
@@ -181,7 +183,7 @@ while not_done:
 Server-side tools (executed inside the model's API call):
 - **Claude**: `web_search_20250305` (returned as transparent text from the SDK)
 - **Codex**: `web_search` with `search_context_size: 'low'` + `include: ['web_search_call.action.sources']`
-- **OpenRouter**: `:online` suffix on model id (routed through OpenRouter's search layer)
+- **OAI (OpenRouter base URL only)**: `:online` suffix on model id (routed through OpenRouter's search layer). Other OpenAI-compatible providers don't support this — use their native search product at the model-id level if available (e.g. Perplexity `sonar-*`).
 
 The planner is **read-only by design** — no Edit, Write, Bash, or MCP tools. Planning-mode discipline enforced by tool selection.
 
@@ -245,7 +247,7 @@ This avoids the failure mode of regex-capturing-to-next-`##`, which broke when j
 ## Judge strategies
 
 - **`rotate`** (default) — persistent round-robin via `_judge_index` in the config. Removes judge bias across runs, preserves genuine independence across tasks.
-- **`claude` / `codex` / `openrouter`** — pin the judge to one provider. Useful when one provider is markedly stronger for a class of task.
+- **`claude` / `codex` / `oai`** — pin the judge to one provider. Useful when one provider is markedly stronger for a class of task. (`openrouter` is still accepted as a legacy alias for `oai`.)
 - **`vote`** — all three provide judgment; outputs concatenated. Currently the simplest synthesis strategy; a future `ranked-choice` with Borda aggregation is on the roadmap.
 
 ## Empirical evidence
@@ -254,8 +256,8 @@ From a controlled experiment on the same task (distributed rate limiter, 1M QPS,
 
 | Variant | Wall time | Final plan length | Cited file:line refs | Notable failures caught |
 |---|---|---|---|---|
-| v1: basic prompts, no web, no agent | 184 s | 8 KB | 0 | OpenRouter's AP+rollback error **missed** |
-| v2: + R0 framing | 556 s | 17 KB | 0 | OpenRouter's AP+rollback error **caught in R2** |
+| v1: basic prompts, no web, no agent | 184 s | 8 KB | 0 | The OAI planner's AP+rollback error **missed** |
+| v2: + R0 framing | 556 s | 17 KB | 0 | The OAI planner's AP+rollback error **caught in R2** |
 | v3: + strong prompts + web search | 661 s | 9 KB (denser) | 0 | All three converged on correct architecture first pass; judge explicitly rejected Claude's self-contradictory pre-reservation and Codex's per-request consensus |
 | v4: + full agent mode (on brownfield code task) | 1040 s | 28 KB | **13** (validated accurate) | Produced PR-ready TypeScript with surgical line-level edits |
 
@@ -267,7 +269,7 @@ The progression from v1 → v4 is the story of the three hypotheses:
 ## Roadmap (known limitations)
 
 - **`ranked-choice` judge strategy** — each judge submits a Borda ballot, runner-up synthesizes with weighted grafts. Currently only `rotate/fixed/vote`.
-- **Codex WHAM agent tool invocation rate** — Codex's model frequently declines to call client tools even when they are registered (unlike Claude and OpenRouter). Not clear whether this is a model, tier, or prompt-injection-protection effect. Investigation pending.
+- **Codex WHAM agent tool invocation rate** — Codex's model frequently declines to call client tools even when they are registered (unlike Claude and the OAI Chat-Completions path). Not clear whether this is a model, tier, or prompt-injection-protection effect. Investigation pending.
 - **Hot-key cost for single-key rate limits** — ironically, the framework's example task surfaced this as a known limitation of the rate limiter design; same physical constraint applies to any extreme-hot-key workload.
 - **No formal "rounds > 1" support** — the framework runs R0–R4 once. Multi-round iteration (R2 → R3 → R2' → R3' → R4) is not yet wired.
 
@@ -288,8 +290,8 @@ src/
     codex/
       auth.ts         OAuth PKCE flow against auth.openai.com
       index.ts        CodexProvider (hand-rolled WHAM client)
-    openrouter/
-      index.ts        OpenRouterProvider (OpenAI SDK, OpenRouter base URL)
+    oai/
+      index.ts        OAIProvider (OpenAI SDK, configurable baseURL; OpenRouterProvider re-exported as alias)
 
   orchestrator/
     index.ts          Orchestrator.run() — the 5-round flow
@@ -299,7 +301,7 @@ src/
     types.ts          AgentEvent union
     claude.ts         Claude agent loop (Anthropic SDK + tool_use)
     codex.ts          Codex WHAM agent loop (manual SSE parser)
-    openrouter.ts     OpenRouter agent loop (OpenAI SDK tools)
+    oai.ts            OAI-compatible agent loop (OpenAI SDK tool_calls; works on any Chat-Completions-compatible endpoint)
 ```
 
 ## Design decisions we explicitly rejected

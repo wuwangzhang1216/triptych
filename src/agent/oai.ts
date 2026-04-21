@@ -1,23 +1,35 @@
 /**
- * OpenRouter agent loop — uses the official `openai` SDK with tool_calls (standard
- * Chat Completions function-calling). OpenRouter is Chat Completions compatible so
- * the SDK works identically to api.openai.com.
+ * OAI agent loop — uses the official `openai` SDK with tool_calls (standard
+ * Chat Completions function-calling). Any endpoint in the OpenAI-compatible
+ * family works identically: OpenRouter, DeepSeek, Moonshot/Kimi, Zhipu/GLM,
+ * DashScope/Qwen, MiniMax, xAI Grok, Mistral, Groq, Together, Fireworks,
+ * Cerebras, DeepInfra, Doubao, SiliconFlow, Perplexity, OpenAI direct, …
  */
 
 import OpenAI from 'openai'
-import { getOpenRouterKey, getOpenRouterModel } from '../config.js'
+import {
+  getOAIBaseUrl,
+  getOAIExtraHeaders,
+  getOAIKey,
+  getOAIModel,
+} from '../config.js'
 import { findTool, type Tool } from './tools.js'
 import type { AgentEvent } from './types.js'
 
 function makeClient(): OpenAI {
-  const apiKey = getOpenRouterKey()
-  if (!apiKey) throw new Error('OpenRouter API key not set.')
+  const apiKey = getOAIKey()
+  if (!apiKey) throw new Error('OAI API key not set. Run: pj config set oai_api_key <key>')
+  const baseURL = getOAIBaseUrl()
+  const isOpenRouter = baseURL.includes('openrouter.ai')
   return new OpenAI({
     apiKey,
-    baseURL: 'https://openrouter.ai/api/v1',
+    baseURL,
     defaultHeaders: {
-      'HTTP-Referer': 'https://github.com/planing-judeger',
-      'X-Title': 'planing-judeger',
+      ...(isOpenRouter ? {
+        'HTTP-Referer': 'https://github.com/wuwangzhang1216/triptych',
+        'X-Title': 'triptych',
+      } : {}),
+      ...getOAIExtraHeaders(),
     },
   })
 }
@@ -43,7 +55,7 @@ function toolsToOpenAIParams(tools: Tool[]): OpenAIFunctionTool[] {
   }))
 }
 
-export interface OpenRouterAgentOptions {
+export interface OAIAgentOptions {
   systemPrompt: string
   userMessage: string
   tools?: Tool[]
@@ -51,12 +63,12 @@ export interface OpenRouterAgentOptions {
   signal: AbortSignal
 }
 
-export async function* runOpenRouterAgent(
-  opts: OpenRouterAgentOptions,
+export async function* runOAIAgent(
+  opts: OAIAgentOptions,
 ): AsyncIterable<AgentEvent> {
   const { systemPrompt, userMessage, tools = [], maxTurns = 10, signal } = opts
   const client = makeClient()
-  const model = getOpenRouterModel()
+  const model = getOAIModel()
 
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     { role: 'system', content: systemPrompt },
@@ -167,3 +179,8 @@ function safeParse(json: string): Record<string, unknown> {
     return { _raw: json }
   }
 }
+
+/** @deprecated use `runOAIAgent` — this alias is kept for library users. */
+export { runOAIAgent as runOpenRouterAgent }
+/** @deprecated use `OAIAgentOptions` — kept for library users. */
+export type { OAIAgentOptions as OpenRouterAgentOptions }

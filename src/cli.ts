@@ -2,19 +2,46 @@
 
 import { Command } from 'commander'
 import { execSync } from 'child_process'
-import { readConfig, setConfigValue, getOpenRouterKey, getClaudeTokens, getCodexTokens } from './config.js'
+import {
+  applyOAIPreset,
+  DEFAULT_OAI_BASE_URL,
+  DEFAULT_OAI_MODEL,
+  findOAIPreset,
+  getClaudeTokens,
+  getCodexTokens,
+  getOAIBaseUrl,
+  getOAIDisplayName,
+  getOAIKey,
+  getOAIModel,
+  OAI_PRESETS,
+  readConfig,
+  setConfigValue,
+} from './config.js'
 import { ClaudeProvider } from './providers/claude/index.js'
 import { CodexProvider } from './providers/codex/index.js'
-import { OpenRouterProvider } from './providers/openrouter/index.js'
+import { OAIProvider } from './providers/oai/index.js'
 import { Orchestrator, type ProgressEvent } from './orchestrator/index.js'
-import type { DebateOptions, JudgeStrategy } from './types.js'
+import type { DebateOptions, JudgeStrategy, ProviderName } from './types.js'
 import { startClaudeOAuthFlow } from './providers/claude/auth.js'
 import { generateAuthUrl, startCallbackListener } from './providers/codex/auth.js'
 
 const program = new Command()
   .name('triptych')
-  .description('Three-model planning debate: Claude × Codex × OpenRouter. Aliased as `pj`.')
-  .version('0.1.0')
+  .description('Three-model planning debate: Claude × Codex × any OpenAI-compatible model. Aliased as `pj`.')
+  .version('0.2.0')
+
+/** Normalize provider names: accept 'openrouter' as a legacy alias for 'oai'. */
+function normalizeProviderName(raw: string): ProviderName {
+  const n = raw.trim().toLowerCase()
+  if (n === 'openrouter' || n === 'openai-compatible' || n === 'openai_compatible') return 'oai'
+  return n as ProviderName
+}
+
+function normalizeJudgeStrategy(raw: string): JudgeStrategy {
+  const n = raw.trim().toLowerCase()
+  if (n === 'openrouter' || n === 'openai-compatible' || n === 'openai_compatible') return 'oai'
+  return n as JudgeStrategy
+}
 
 // ── pj run ──────────────────────────────────────────────────────────────────
 
@@ -24,10 +51,10 @@ program
   .option('-c, --context <text>', 'Additional context for the task')
   .option(
     '--judge <strategy>',
-    'Judge strategy: rotate|claude|codex|openrouter|vote',
+    'Judge strategy: rotate|claude|codex|oai|vote',
     'rotate',
   )
-  .option('--providers <list>', 'Comma-separated providers to use', 'claude,codex,openrouter')
+  .option('--providers <list>', 'Comma-separated providers to use', 'claude,codex,oai')
   .option('--no-stream', 'Suppress streaming output, show only final result')
   .option('-v, --verbose', 'Show all intermediate steps')
   .option('-o, --output <file>', 'Save full debate JSON (all rounds + metadata) to file')
@@ -44,18 +71,19 @@ program
     const allProviders = [
       new ClaudeProvider(),
       new CodexProvider(),
-      new OpenRouterProvider(),
+      new OAIProvider(),
     ]
 
-    const selectedNames = opts.providers.split(',').map(s => s.trim())
+    const selectedNames = opts.providers.split(',').map(s => normalizeProviderName(s))
 
     // Check authentication
     for (const p of allProviders) {
       if (!selectedNames.includes(p.name)) continue
       if (!(await p.isAuthenticated())) {
         console.error(`\n✗ ${p.name} is not authenticated.`)
-        if (p.name === 'openrouter') {
-          console.error('  Run: pj config set openrouter_api_key <your-key>')
+        if (p.name === 'oai') {
+          console.error('  Run: pj config set oai_api_key <your-key>')
+          console.error('  Or pick a provider:  pj config preset deepseek|kimi|glm|qwen|minimax|groq|mistral|xai|...')
         } else {
           console.error(`  Run: pj login ${p.name}`)
         }
@@ -64,8 +92,8 @@ program
     }
 
     const options: DebateOptions = {
-      providers: selectedNames as any,
-      judge: opts.judge as JudgeStrategy,
+      providers: selectedNames,
+      judge: normalizeJudgeStrategy(opts.judge),
       verbose: opts.verbose,
     }
 
@@ -206,7 +234,7 @@ program
 
 program
   .command('login <provider>')
-  .description('Authenticate a provider (claude | codex)')
+  .description('Authenticate a provider (claude | codex). For oai, use `pj config set oai_api_key <key>`.')
   .action(async (provider: string) => {
     if (provider === 'claude') {
       console.log('\nStarting Claude OAuth flow...')
@@ -254,7 +282,9 @@ program
       })
     } else {
       console.error(`Unknown provider: ${provider}. Use: claude | codex`)
-      console.error('For OpenRouter, use: pj config set openrouter_api_key <key>')
+      console.error('For the third slot (OpenAI-compatible), use:')
+      console.error('  pj config set oai_api_key <key>')
+      console.error('  pj config preset <deepseek|kimi|glm|qwen|minimax|groq|mistral|xai|...>')
       process.exit(1)
     }
   })
@@ -267,18 +297,65 @@ program
   .action(() => {
     const claude = getClaudeTokens()
     const codex = getCodexTokens()
-    const orKey = getOpenRouterKey()
+    const oaiKey = getOAIKey()
     const config = readConfig()
 
+    const oaiLabel = getOAIDisplayName()
+    const oaiModel = getOAIModel()
+    const oaiBase = getOAIBaseUrl()
+
     console.log('\nProvider Status:')
-    console.log(`  Claude      ${claude ? `✓ authenticated (model: ${config.claude_model ?? 'claude-opus-4-7'}${config.claude_web_search ? ' +web' : ''}${config.claude_agent ? ' +agent' : ''})` : '✗ not authenticated — run: pj login claude'}`)
-    console.log(`  Codex       ${codex ? `✓ authenticated as ${codex.email} (model: ${config.codex_model ?? 'gpt-5.4'}${config.codex_web_search ? ' +web' : ''}${config.codex_agent ? ' +agent' : ''})` : '✗ not authenticated — run: pj login codex'}`)
-    console.log(`  OpenRouter  ${orKey ? `✓ key set (model: ${config.openrouter_model ?? 'minimax/minimax-m2.7'}${config.openrouter_web_search ? ' +web' : ''}${config.openrouter_agent ? ' +agent' : ''})` : '✗ not set — run: pj config set openrouter_api_key <key>'}`)
+    console.log(`  Claude   ${claude ? `✓ authenticated (model: ${config.claude_model ?? 'claude-opus-4-7'}${config.claude_web_search ? ' +web' : ''}${config.claude_agent ? ' +agent' : ''})` : '✗ not authenticated — run: pj login claude'}`)
+    console.log(`  Codex    ${codex ? `✓ authenticated as ${codex.email} (model: ${config.codex_model ?? 'gpt-5.4'}${config.codex_web_search ? ' +web' : ''}${config.codex_agent ? ' +agent' : ''})` : '✗ not authenticated — run: pj login codex'}`)
+    if (oaiKey) {
+      const webFlag = (config.oai_web_search ?? config.openrouter_web_search) ? ' +web' : ''
+      const agentFlag = (config.oai_agent ?? config.openrouter_agent) ? ' +agent' : ''
+      console.log(`  OAI      ✓ ${oaiLabel} (model: ${oaiModel}${webFlag}${agentFlag})`)
+      console.log(`           base_url: ${oaiBase}`)
+    } else {
+      console.log('  OAI      ✗ not set — run: pj config set oai_api_key <key>')
+      console.log('             then pick a provider: pj config preset <deepseek|kimi|glm|qwen|...>')
+    }
     console.log()
     console.log(`  Default judge: ${config.default_judge ?? 'rotate'}`)
   })
 
 // ── pj config ───────────────────────────────────────────────────────────────
+
+const ALLOWED_CONFIG_KEYS = [
+  // New canonical OAI keys
+  'oai_api_key',
+  'oai_base_url',
+  'oai_model',
+  'oai_web_search',
+  'oai_agent',
+  'oai_display_name',
+  // Legacy openrouter_* aliases (still accepted; getters also fall back to these)
+  'openrouter_api_key',
+  'openrouter_model',
+  'openrouter_web_search',
+  'openrouter_agent',
+  // Claude / Codex
+  'claude_model',
+  'claude_web_search',
+  'claude_agent',
+  'codex_model',
+  'codex_web_search',
+  'codex_agent',
+  // Orchestration
+  'default_judge',
+] as const
+
+const BOOLEAN_CONFIG_KEYS = new Set([
+  'oai_web_search',
+  'oai_agent',
+  'openrouter_web_search',
+  'openrouter_agent',
+  'claude_web_search',
+  'claude_agent',
+  'codex_web_search',
+  'codex_agent',
+])
 
 program
   .command('config')
@@ -289,33 +366,12 @@ program
       .argument('<value>', 'Config value')
       .description('Set a config value')
       .action((key: string, value: string) => {
-        const allowed = [
-          'openrouter_api_key',
-          'openrouter_model',
-          'openrouter_web_search',
-          'openrouter_agent',
-          'claude_model',
-          'claude_web_search',
-          'claude_agent',
-          'codex_model',
-          'codex_web_search',
-          'codex_agent',
-          'default_judge',
-        ]
-        const booleanKeys = new Set([
-          'openrouter_web_search',
-          'openrouter_agent',
-          'claude_web_search',
-          'claude_agent',
-          'codex_web_search',
-          'codex_agent',
-        ])
-        if (!allowed.includes(key)) {
+        if (!ALLOWED_CONFIG_KEYS.includes(key as typeof ALLOWED_CONFIG_KEYS[number])) {
           console.error(`Unknown config key: ${key}`)
-          console.error(`Allowed keys: ${allowed.join(', ')}`)
+          console.error(`Allowed keys: ${ALLOWED_CONFIG_KEYS.join(', ')}`)
           process.exit(1)
         }
-        if (booleanKeys.has(key)) {
+        if (BOOLEAN_CONFIG_KEYS.has(key)) {
           setConfigValue(key as any, value === 'true' || value === '1')
         } else {
           setConfigValue(key as any, value)
@@ -334,9 +390,55 @@ program
           claude_refresh_token: config.claude_refresh_token ? '[set]' : undefined,
           codex_access_token: config.codex_access_token ? '[set]' : undefined,
           codex_refresh_token: config.codex_refresh_token ? '[set]' : undefined,
+          oai_api_key: config.oai_api_key ? '[set]' : undefined,
           openrouter_api_key: config.openrouter_api_key ? '[set]' : undefined,
         }
         console.log(JSON.stringify(safe, null, 2))
+      }),
+  )
+  .addCommand(
+    new Command('preset')
+      .argument('[name]', 'Preset name (omit to list available presets)')
+      .description('Apply a built-in preset (base_url + default model) for a popular OpenAI-compatible provider')
+      .option('--keep-model', 'Keep the currently-configured oai_model instead of switching to the preset default')
+      .action((name: string | undefined, opts: { keepModel?: boolean }) => {
+        if (!name) {
+          console.log('\nAvailable presets (pj config preset <name>):\n')
+          const rows = OAI_PRESETS.map(p => [
+            p.name.padEnd(14),
+            p.display_name.padEnd(26),
+            p.base_url.padEnd(54),
+            p.default_model,
+          ])
+          for (const r of rows) console.log('  ' + r.join('  '))
+          console.log(`\nDefault (no preset applied): ${DEFAULT_OAI_BASE_URL}  model=${DEFAULT_OAI_MODEL}`)
+          console.log('\nAfter selecting a preset, set your API key:')
+          console.log('  pj config set oai_api_key <your-key>')
+          return
+        }
+        try {
+          const preset = applyOAIPreset(name, { overrideModel: !opts.keepModel })
+          console.log(`✓ Applied preset "${preset.name}" (${preset.display_name})`)
+          console.log(`  oai_base_url = ${preset.base_url}`)
+          console.log(`  oai_model    = ${opts.keepModel ? getOAIModel() : preset.default_model}`)
+          const key = getOAIKey()
+          if (!key) {
+            console.log('\nNext: pj config set oai_api_key <your-key>')
+          }
+        } catch (err) {
+          console.error(`✗ ${(err as Error).message}`)
+          process.exit(1)
+        }
+      }),
+  )
+  .addCommand(
+    new Command('presets')
+      .description('List all built-in presets')
+      .action(() => {
+        for (const p of OAI_PRESETS) {
+          console.log(`${p.name.padEnd(14)}  ${p.display_name.padEnd(26)}  ${p.base_url}`)
+          console.log(`${''.padEnd(14)}  default model: ${p.default_model}`)
+        }
       }),
   )
 

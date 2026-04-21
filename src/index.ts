@@ -1,6 +1,6 @@
 export { Orchestrator } from './orchestrator/index.js'
 export { ClaudeProvider } from './providers/claude/index.js'
 export { CodexProvider } from './providers/codex/index.js'
-export { OpenRouterProvider } from './providers/openrouter/index.js'
+export { OAIProvider, OpenRouterProvider } from './providers/oai/index.js'
 export * from './types.js'
 export * from './config.js'

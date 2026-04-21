@@ -71,18 +71,19 @@ export interface DebateResult {
   totalDurationMs: number
 }
 
-export type ProviderName = 'claude' | 'codex' | 'openrouter'
+export type ProviderName = 'claude' | 'codex' | 'oai'
 
 export type JudgeStrategy =
   | 'rotate'       // 每次换一个模型做主裁
   | 'claude'       // 固定 Claude 做主裁
   | 'codex'        // 固定 Codex 做主裁
-  | 'openrouter'   // 固定 OpenRouter 做主裁
+  | 'oai'          // 固定第三方 (OpenAI-compatible) 模型做主裁
+  | 'openrouter'   // 'oai' 的兼容别名，保留给老用户
   | 'vote'         // 三模型投票, 多数决
 
 /** Runtime options for a debate session */
 export interface DebateOptions {
-  providers?: ProviderName[]      // 默认 ['claude', 'codex', 'openrouter']
+  providers?: ProviderName[]      // 默认 ['claude', 'codex', 'oai']
   judge?: JudgeStrategy           // 默认 'rotate'
   rounds?: number                 // 辩论轮数, 默认 1 (= R1-R4 一个完整循环)
   verbose?: boolean

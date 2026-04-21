@@ -1,11 +1,23 @@
 /**
- * OpenRouter provider — uses the official `openai` SDK pointed at openrouter.ai,
- * which is OpenAI-Chat-Completions compatible.
+ * OAI provider — the generic "any OpenAI-compatible endpoint" slot.
+ *
+ * Points the official `openai` SDK at whatever `oai_base_url` resolves to:
+ * OpenRouter (default), DeepSeek, Moonshot/Kimi, Zhipu/GLM, DashScope/Qwen,
+ * MiniMax, xAI Grok, Mistral, Groq, Together, Fireworks, Cerebras, DeepInfra,
+ * SiliconFlow, Doubao, Perplexity, OpenAI direct, … All speak Chat Completions
+ * so the SDK call is identical; the provider only varies `apiKey`, `baseURL`,
+ * and `model`.
  */
 
 import OpenAI from 'openai'
-import { getOpenRouterAgentMode, getOpenRouterKey, getOpenRouterModel } from '../../config.js'
-import { runOpenRouterAgent } from '../../agent/openrouter.js'
+import {
+  getOAIAgentMode,
+  getOAIBaseUrl,
+  getOAIExtraHeaders,
+  getOAIKey,
+  getOAIModel,
+} from '../../config.js'
+import { runOAIAgent } from '../../agent/oai.js'
 import { DEFAULT_TOOLS } from '../../agent/tools.js'
 import type {
   CritiqueResult,
@@ -24,29 +36,40 @@ import {
   buildRevisePrompt,
 } from '../prompts.js'
 
-function makeClient(): OpenAI {
-  const apiKey = getOpenRouterKey()
+export function makeOAIClient(): OpenAI {
+  const apiKey = getOAIKey()
   if (!apiKey) {
-    throw new Error('OpenRouter API key not set. Run: pj config set openrouter_api_key <key>')
+    throw new Error(
+      'OAI API key not set. Run: pj config set oai_api_key <key>  ' +
+      '(legacy key `openrouter_api_key` is still honored.)',
+    )
   }
+  const baseURL = getOAIBaseUrl()
+  const isOpenRouter = baseURL.includes('openrouter.ai')
   return new OpenAI({
     apiKey,
-    baseURL: 'https://openrouter.ai/api/v1',
+    baseURL,
     defaultHeaders: {
-      'HTTP-Referer': 'https://github.com/planing-judeger',
-      'X-Title': 'planing-judeger',
+      // These headers are OpenRouter-specific rank/analytics metadata. Other
+      // endpoints don't read them, but sending unknown headers can still
+      // confuse stricter gateways — so gate them.
+      ...(isOpenRouter ? {
+        'HTTP-Referer': 'https://github.com/wuwangzhang1216/triptych',
+        'X-Title': 'triptych',
+      } : {}),
+      ...getOAIExtraHeaders(),
     },
   })
 }
 
-async function* streamOpenRouter(
+async function* streamOAI(
   systemPrompt: string,
   userMessage: string,
   signal: AbortSignal,
 ): AsyncIterable<StreamChunk> {
-  if (getOpenRouterAgentMode()) {
+  if (getOAIAgentMode()) {
     let fullText = ''
-    for await (const ev of runOpenRouterAgent({
+    for await (const ev of runOAIAgent({
       systemPrompt,
       userMessage,
       tools: DEFAULT_TOOLS,
@@ -64,10 +87,10 @@ async function* streamOpenRouter(
     return
   }
 
-  const client = makeClient()
+  const client = makeOAIClient()
   const stream = await client.chat.completions.create(
     {
-      model: getOpenRouterModel(),
+      model: getOAIModel(),
       stream: true,
       messages: [
         { role: 'system', content: systemPrompt },
@@ -90,22 +113,22 @@ async function* streamOpenRouter(
   yield { type: 'done', fullText }
 }
 
-export class OpenRouterProvider implements PlanningProvider {
-  readonly name = 'openrouter' as const
-  get model(): string { return getOpenRouterModel() }
+export class OAIProvider implements PlanningProvider {
+  readonly name = 'oai' as const
+  get model(): string { return getOAIModel() }
 
   async isAuthenticated(): Promise<boolean> {
-    return getOpenRouterKey() != null
+    return getOAIKey() != null
   }
 
   async *frame(req: PlanRequest, signal: AbortSignal): AsyncIterable<StreamChunk> {
     const { system, user } = buildFramePrompt(req)
-    yield* streamOpenRouter(system, user, signal)
+    yield* streamOAI(system, user, signal)
   }
 
   async *plan(req: PlanRequest, frames: FrameResult[], signal: AbortSignal): AsyncIterable<StreamChunk> {
     const { system, user } = buildPlanPrompt(req, frames)
-    yield* streamOpenRouter(system, user, signal)
+    yield* streamOAI(system, user, signal)
   }
 
   async *critique(
@@ -114,7 +137,7 @@ export class OpenRouterProvider implements PlanningProvider {
     signal: AbortSignal,
   ): AsyncIterable<StreamChunk> {
     const { system, user } = buildCritiquePrompt(req, theirPlan)
-    yield* streamOpenRouter(system, user, signal)
+    yield* streamOAI(system, user, signal)
   }
 
   async *revise(
@@ -124,7 +147,7 @@ export class OpenRouterProvider implements PlanningProvider {
     signal: AbortSignal,
   ): AsyncIterable<StreamChunk> {
     const { system, user } = buildRevisePrompt(req, myPlan, critiques)
-    yield* streamOpenRouter(system, user, signal)
+    yield* streamOAI(system, user, signal)
   }
 
   async *judge(
@@ -135,6 +158,9 @@ export class OpenRouterProvider implements PlanningProvider {
     signal: AbortSignal,
   ): AsyncIterable<StreamChunk> {
     const { system, user } = buildJudgePrompt(req, allPlans, allCritiques, allRevisions)
-    yield* streamOpenRouter(system, user, signal)
+    yield* streamOAI(system, user, signal)
   }
 }
+
+/** @deprecated use `OAIProvider` — this alias is kept for library users. */
+export { OAIProvider as OpenRouterProvider }

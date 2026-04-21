@@ -55,7 +55,10 @@ function pickJudge(
 ): PlanningProvider {
   if (strategy === 'claude') return providers.find(p => p.name === 'claude') ?? providers[0]!
   if (strategy === 'codex') return providers.find(p => p.name === 'codex') ?? providers[0]!
-  if (strategy === 'openrouter') return providers.find(p => p.name === 'openrouter') ?? providers[0]!
+  if (strategy === 'oai' || strategy === 'openrouter') {
+    // Legacy 'openrouter' is kept as an alias for 'oai'.
+    return providers.find(p => p.name === 'oai') ?? providers[0]!
+  }
 
   if (strategy === 'rotate') {
     const config = readConfig()
@@ -75,7 +78,7 @@ export class Orchestrator {
   constructor(providers: PlanningProvider[], options: DebateOptions = {}) {
     this.providers = providers
     this.options = {
-      providers: options.providers ?? ['claude', 'codex', 'openrouter'],
+      providers: options.providers ?? ['claude', 'codex', 'oai'],
       judge: options.judge ?? 'rotate',
       rounds: options.rounds ?? 1,
       verbose: options.verbose ?? false,
