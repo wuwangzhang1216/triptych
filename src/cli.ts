@@ -24,11 +24,46 @@ import { Orchestrator, type ProgressEvent } from './orchestrator/index.js'
 import type { DebateOptions, JudgeStrategy, ProviderName } from './types.js'
 import { startClaudeOAuthFlow } from './providers/claude/auth.js'
 import { generateAuthUrl, startCallbackListener } from './providers/codex/auth.js'
+import { Dashboard } from './cli/dashboard.js'
+import {
+  arrow,
+  bold,
+  checkmark,
+  cross,
+  cyan,
+  dim,
+  divider,
+  formatElapsed,
+  green,
+  heavyDivider,
+  hideCursor,
+  IS_TTY,
+  kv,
+  magenta,
+  phaseBanner,
+  providerColor,
+  providerTag,
+  red,
+  renderMarkdownForTerminal,
+  showCursor,
+  yellow,
+} from './cli/ui.js'
 
 const program = new Command()
   .name('triptych')
   .description('Three-model planning debate: Claude × Codex × any OpenAI-compatible model. Aliased as `pj`.')
   .version('0.2.0')
+
+// Shared: give Ctrl+C a clean exit path that restores the cursor.
+function installSigintHandler(ac: AbortController, extraCleanup?: () => void): void {
+  process.on('SIGINT', () => {
+    ac.abort()
+    if (extraCleanup) extraCleanup()
+    showCursor()
+    process.stderr.write('\n' + yellow('⏹  Aborted.') + '\n')
+    process.exit(130)
+  })
+}
 
 /** Normalize provider names: accept 'openrouter' as a legacy alias for 'oai'. */
 function normalizeProviderName(raw: string): ProviderName {
@@ -56,7 +91,7 @@ program
   )
   .option('--providers <list>', 'Comma-separated providers to use', 'claude,codex,oai')
   .option('--no-stream', 'Suppress streaming output, show only final result')
-  .option('-v, --verbose', 'Show all intermediate steps')
+  .option('-v, --verbose', 'Show every model\'s output as it streams')
   .option('-o, --output <file>', 'Save full debate JSON (all rounds + metadata) to file')
   .option('-p, --plan-out <file>', 'Save just the Final Plan markdown to file')
   .action(async (task: string, opts: {
@@ -76,16 +111,16 @@ program
 
     const selectedNames = opts.providers.split(',').map(s => normalizeProviderName(s))
 
-    // Check authentication
+    // Auth check up front
     for (const p of allProviders) {
       if (!selectedNames.includes(p.name)) continue
       if (!(await p.isAuthenticated())) {
-        console.error(`\n✗ ${p.name} is not authenticated.`)
+        console.error('\n' + cross() + ' ' + providerTag(p.name) + red(' is not authenticated.'))
         if (p.name === 'oai') {
-          console.error('  Run: pj config set oai_api_key <your-key>')
-          console.error('  Or pick a provider:  pj config preset deepseek|kimi|glm|qwen|minimax|groq|mistral|xai|...')
+          console.error('  ' + dim('Run:') + ' pj config set oai_api_key <your-key>')
+          console.error('  ' + dim('Or pick a provider:') + ' pj config preset deepseek|kimi|glm|qwen|...')
         } else {
-          console.error(`  Run: pj login ${p.name}`)
+          console.error('  ' + dim('Run:') + ' pj login ' + p.name)
         }
         process.exit(1)
       }
@@ -99,112 +134,204 @@ program
 
     const orchestrator = new Orchestrator(allProviders, options)
 
-    const phaseLabels: Record<string, string> = {
-      r0_start: '🎯 R0 任务对齐',
-      r1_start: '📋 R1 独立规划',
-      r2_start: '🔍 R2 交叉评审',
-      r3_start: '✏️  R3 修订',
-      r4_start: '⚖️  R4 仲裁',
+    // ── Header ──
+    console.log()
+    console.log(bold('⚡ triptych') + dim('  ') + dim(`(${selectedNames.join(' × ')} · judge=${options.judge})`))
+    console.log(heavyDivider())
+    console.log(dim('Task'))
+    console.log('  ' + task.split('\n').join('\n  '))
+    if (opts.context) {
+      console.log(dim('Context'))
+      console.log('  ' + opts.context.split('\n').join('\n  '))
+    }
+    console.log(heavyDivider())
+    console.log()
+
+    const dashboard = new Dashboard()
+    const ac = new AbortController()
+    installSigintHandler(ac, () => dashboard.finalize())
+
+    // In verbose mode we print streams inline and skip the dashboard (its
+    // in-place updates would fight with the token stream). Non-verbose mode
+    // is the default and shows the dashboard with per-provider live status.
+    const useDashboard = !opts.verbose
+
+    // Shared state for verbose streaming tag management
+    let currentStreamKey = ''
+
+    function openVerboseStream(key: string, colored: string): void {
+      if (currentStreamKey === key) return
+      if (currentStreamKey) process.stdout.write('\n')
+      currentStreamKey = key
+      process.stdout.write('\n' + dim('┃ ') + colored + '\n' + dim('┃ '))
     }
 
-    let currentProvider = ''
-    let currentPhase = ''
-    let lineBuffer = ''
-
-    const onProgress = (event: ProgressEvent) => {
-      if (event.phase === 'r0_start') {
-        console.log(`\n${phaseLabels.r0_start} — ${event.providers.join(' × ')}`)
-      } else if (event.phase === 'r0_done') {
-        if (!opts.verbose) console.log('  ✓ All frames complete')
-      } else if (event.phase === 'r0_stream') {
-        const provider = 'provider' in event ? event.provider : ''
-        if (opts.stream && opts.verbose) {
-          if (provider !== currentProvider || currentPhase !== event.phase) {
-            if (lineBuffer) { process.stdout.write('\n'); lineBuffer = '' }
-            currentProvider = provider
-            currentPhase = event.phase
-            process.stdout.write(`\n[${provider}] `)
-          }
-          if (event.chunk.type === 'text') {
-            process.stdout.write(event.chunk.text)
-            lineBuffer += event.chunk.text
-          }
-        } else if (event.chunk.type === 'done') {
-          process.stdout.write(` ✓ ${provider}\n`)
-        }
-      } else if (event.phase === 'r1_start') {
-        console.log(`\n${phaseLabels.r1_start} — ${event.providers.join(' × ')}`)
-      } else if (event.phase === 'r2_start') {
-        console.log(`\n${phaseLabels.r2_start}`)
-        for (const { reviewer, target } of event.pairs) {
-          console.log(`  ${reviewer} → ${target}`)
-        }
-      } else if (event.phase === 'r3_start') {
-        console.log(`\n${phaseLabels.r3_start}`)
-      } else if (event.phase === 'r4_start') {
-        console.log(`\n${phaseLabels.r4_start} (judge: ${event.judge})`)
-      } else if (event.phase === 'r1_stream' || event.phase === 'r3_stream') {
-        const provider = 'provider' in event ? event.provider : ''
-        if (opts.stream && opts.verbose) {
-          if (provider !== currentProvider || currentPhase !== event.phase) {
-            if (lineBuffer) { process.stdout.write('\n'); lineBuffer = '' }
-            currentProvider = provider
-            currentPhase = event.phase
-            process.stdout.write(`\n[${provider}] `)
-          }
-          if (event.chunk.type === 'text') {
-            process.stdout.write(event.chunk.text)
-            lineBuffer += event.chunk.text
-          }
-        } else if (event.chunk.type === 'done') {
-          process.stdout.write(` ✓ ${provider}\n`)
-        }
-      } else if (event.phase === 'r2_stream') {
-        if (opts.stream && opts.verbose) {
-          const key = `${event.reviewer}→${event.target}`
-          if (key !== currentProvider || currentPhase !== event.phase) {
-            if (lineBuffer) { process.stdout.write('\n'); lineBuffer = '' }
-            currentProvider = key
-            currentPhase = event.phase
-            process.stdout.write(`\n[${event.reviewer}→${event.target}] `)
-          }
-          if (event.chunk.type === 'text') {
-            process.stdout.write(event.chunk.text)
-          }
-        } else if (event.chunk.type === 'done') {
-          process.stdout.write(`  ✓ ${event.reviewer} → ${event.target}\n`)
-        }
-      } else if (event.phase === 'r4_stream') {
-        if (opts.stream) {
-          if (event.chunk.type === 'text') {
-            process.stdout.write(event.chunk.text)
-          }
-        }
-      } else if (event.phase === 'r1_done') {
-        if (!opts.verbose) console.log('  ✓ All initial plans complete')
-      } else if (event.phase === 'r2_done') {
-        if (!opts.verbose) console.log('  ✓ All critiques complete')
-      } else if (event.phase === 'r3_done') {
-        if (!opts.verbose) console.log('  ✓ All revisions complete')
-      } else if (event.phase === 'r4_done') {
-        console.log('\n')
-        console.log('═'.repeat(60))
-        console.log('  FINAL PLAN')
-        console.log('═'.repeat(60))
-        console.log()
-        if (!opts.stream) {
-          console.log(event.result.finalPlan)
-        }
-        console.log()
-        console.log(`Total time: ${(event.result.durationMs / 1000).toFixed(1)}s`)
+    function endVerboseStream(): void {
+      if (currentStreamKey) {
+        process.stdout.write('\n')
+        currentStreamKey = ''
       }
     }
 
-    console.log(`\nTask: ${task}`)
-    console.log('─'.repeat(60))
+    const onProgress = (event: ProgressEvent) => {
+      switch (event.phase) {
+        // ── R0 framing ──────────────────────────────────────────────────────
+        case 'r0_start': {
+          endVerboseStream()
+          console.log(phaseBanner('r0', event.providers.join(' × ')))
+          if (useDashboard) {
+            dashboard.reset()
+            dashboard.start()
+            for (const p of event.providers) dashboard.addRow(p, providerTag(p))
+          }
+          break
+        }
+        case 'r0_stream': {
+          if (useDashboard) {
+            if (event.chunk.type === 'text') dashboard.incrementChars(event.provider, event.chunk.text.length)
+            else if (event.chunk.type === 'done') dashboard.markDone(event.provider, event.chunk.fullText.length)
+          } else if (opts.stream) {
+            if (event.chunk.type === 'text') {
+              openVerboseStream(`r0:${event.provider}`, providerColor(event.provider, `▸ R0  ${event.provider}`))
+              process.stdout.write(event.chunk.text.replace(/\n/g, '\n' + dim('┃ ')))
+            }
+          }
+          break
+        }
+        case 'r0_done': {
+          if (useDashboard) dashboard.finalize()
+          else endVerboseStream()
+          console.log()
+          break
+        }
 
-    const ac = new AbortController()
-    process.on('SIGINT', () => { ac.abort(); process.exit(0) })
+        // ── R1 independent planning ─────────────────────────────────────────
+        case 'r1_start': {
+          endVerboseStream()
+          console.log(phaseBanner('r1', event.providers.join(' × ')))
+          if (useDashboard) {
+            dashboard.reset()
+            dashboard.start()
+            for (const p of event.providers) dashboard.addRow(p, providerTag(p))
+          }
+          break
+        }
+        case 'r1_stream': {
+          if (useDashboard) {
+            if (event.chunk.type === 'text') dashboard.incrementChars(event.provider, event.chunk.text.length)
+            else if (event.chunk.type === 'done') dashboard.markDone(event.provider, event.chunk.fullText.length)
+          } else if (opts.stream) {
+            if (event.chunk.type === 'text') {
+              openVerboseStream(`r1:${event.provider}`, providerColor(event.provider, `▸ R1  ${event.provider}`))
+              process.stdout.write(event.chunk.text.replace(/\n/g, '\n' + dim('┃ ')))
+            }
+          }
+          break
+        }
+        case 'r1_done': {
+          if (useDashboard) dashboard.finalize()
+          else endVerboseStream()
+          console.log()
+          break
+        }
+
+        // ── R2 cross-critique (N×(N-1) pairs) ───────────────────────────────
+        case 'r2_start': {
+          endVerboseStream()
+          const pairSummary = event.pairs.length + ' pairs'
+          console.log(phaseBanner('r2', pairSummary))
+          if (useDashboard) {
+            dashboard.reset()
+            dashboard.start()
+            for (const { reviewer, target } of event.pairs) {
+              const key = `${reviewer}→${target}`
+              const label = `${providerColor(reviewer, reviewer.padEnd(7))} ${dim('→')} ${providerColor(target, target.padEnd(7))}`
+              dashboard.addRow(key, label)
+            }
+          } else {
+            for (const { reviewer, target } of event.pairs) {
+              console.log(`  ${dim('·')} ${providerColor(reviewer, reviewer)} ${arrow()} ${providerColor(target, target)}`)
+            }
+          }
+          break
+        }
+        case 'r2_stream': {
+          const key = `${event.reviewer}→${event.target}`
+          if (useDashboard) {
+            if (event.chunk.type === 'text') dashboard.incrementChars(key, event.chunk.text.length)
+            else if (event.chunk.type === 'done') dashboard.markDone(key, event.chunk.fullText.length)
+          } else if (opts.stream) {
+            if (event.chunk.type === 'text') {
+              const label = providerColor(event.reviewer, `▸ R2  ${event.reviewer}`) + dim('→') + providerColor(event.target, event.target)
+              openVerboseStream(`r2:${key}`, label)
+              process.stdout.write(event.chunk.text.replace(/\n/g, '\n' + dim('┃ ')))
+            }
+          }
+          break
+        }
+        case 'r2_done': {
+          if (useDashboard) dashboard.finalize()
+          else endVerboseStream()
+          console.log()
+          break
+        }
+
+        // ── R3 revision ─────────────────────────────────────────────────────
+        case 'r3_start': {
+          endVerboseStream()
+          console.log(phaseBanner('r3', event.providers.join(' × ')))
+          if (useDashboard) {
+            dashboard.reset()
+            dashboard.start()
+            for (const p of event.providers) dashboard.addRow(p, providerTag(p))
+          }
+          break
+        }
+        case 'r3_stream': {
+          if (useDashboard) {
+            if (event.chunk.type === 'text') dashboard.incrementChars(event.provider, event.chunk.text.length)
+            else if (event.chunk.type === 'done') dashboard.markDone(event.provider, event.chunk.fullText.length)
+          } else if (opts.stream) {
+            if (event.chunk.type === 'text') {
+              openVerboseStream(`r3:${event.provider}`, providerColor(event.provider, `▸ R3  ${event.provider}`))
+              process.stdout.write(event.chunk.text.replace(/\n/g, '\n' + dim('┃ ')))
+            }
+          }
+          break
+        }
+        case 'r3_done': {
+          if (useDashboard) dashboard.finalize()
+          else endVerboseStream()
+          console.log()
+          break
+        }
+
+        // ── R4 judgment — always stream this to stdout; it's the deliverable
+        case 'r4_start': {
+          endVerboseStream()
+          console.log(phaseBanner('r4', `judge: ${providerColor(event.judge, event.judge)}`))
+          console.log(divider())
+          break
+        }
+        case 'r4_stream': {
+          if (opts.stream && event.chunk.type === 'text') {
+            process.stdout.write(event.chunk.text)
+          }
+          break
+        }
+        case 'r4_done': {
+          if (!opts.stream) {
+            // Non-streaming mode: we never wrote anything during r4_stream, so emit now.
+            process.stdout.write(renderMarkdownForTerminal(event.result.finalPlan))
+          }
+          process.stdout.write('\n\n')
+          console.log(heavyDivider())
+          console.log(bold('  📜 Final Plan') + dim(` · synthesized by ${providerColor(event.result.judge, event.result.judge)} · ${formatElapsed(event.result.durationMs)}`))
+          console.log(heavyDivider())
+          break
+        }
+      }
+    }
 
     try {
       const result = await orchestrator.run(
@@ -213,19 +340,24 @@ program
         ac.signal,
       )
 
-      console.log(`Total debate time: ${(result.totalDurationMs / 1000).toFixed(1)}s`)
+      console.log()
+      console.log(dim('Total debate time: ') + cyan(formatElapsed(result.totalDurationMs)))
 
       const { writeFileSync } = await import('fs')
       if (opts.output) {
         writeFileSync(opts.output, JSON.stringify(result, null, 2), 'utf-8')
-        console.log(`\nFull debate saved to: ${opts.output}`)
+        console.log('  ' + checkmark() + ' full debate JSON → ' + cyan(opts.output))
       }
       if (opts.planOut) {
         writeFileSync(opts.planOut, result.rounds.r4_judgment.finalPlan, 'utf-8')
-        console.log(`Final Plan markdown saved to: ${opts.planOut}`)
+        console.log('  ' + checkmark() + ' final plan markdown → ' + cyan(opts.planOut))
       }
+      console.log()
+      showCursor()
     } catch (err) {
-      console.error('\n✗ Error:', (err as Error).message)
+      dashboard.finalize()
+      showCursor()
+      console.error('\n' + cross() + ' ' + red((err as Error).message))
       process.exit(1)
     }
   })
@@ -237,8 +369,8 @@ program
   .description('Authenticate a provider (claude | codex). For oai, use `pj config set oai_api_key <key>`.')
   .action(async (provider: string) => {
     if (provider === 'claude') {
-      console.log('\nStarting Claude OAuth flow...')
-      console.log('A browser window will open. If it does not, use the manual URL below.\n')
+      console.log('\n' + bold('Starting Claude OAuth flow') + '...')
+      console.log(dim('A browser window will open. If it does not, use the manual URL below.') + '\n')
 
       try {
         await startClaudeOAuthFlow(
@@ -246,23 +378,23 @@ program
             try { execSync(`open "${url}"`) } catch { /* macOS only */ }
           },
           (url) => {
-            console.log('Manual login URL:')
-            console.log(url)
+            console.log(dim('Manual login URL:'))
+            console.log('  ' + cyan(url))
             console.log()
           },
         )
-        console.log('\n✓ Claude authenticated successfully!')
+        console.log('\n' + checkmark() + ' ' + green('Claude authenticated.'))
       } catch (err) {
-        console.error('\n✗ Claude login failed:', (err as Error).message)
+        console.error('\n' + cross() + ' Claude login failed: ' + red((err as Error).message))
         process.exit(1)
       }
     } else if (provider === 'codex') {
-      console.log('\nStarting Codex (ChatGPT) OAuth flow...')
+      console.log('\n' + bold('Starting Codex (ChatGPT) OAuth flow') + '...')
 
       const { authUrl } = generateAuthUrl()
-      console.log('Opening browser...')
-      console.log('\nLogin URL (if browser does not open):')
-      console.log(authUrl)
+      console.log(dim('Opening browser...'))
+      console.log('\n' + dim('Login URL (if browser does not open):'))
+      console.log('  ' + cyan(authUrl))
       console.log()
 
       try {
@@ -272,17 +404,17 @@ program
       await new Promise<void>((resolve, reject) => {
         startCallbackListener(({ tokens, error }) => {
           if (error) {
-            console.error('\n✗ Codex login failed:', error)
+            console.error('\n' + cross() + ' Codex login failed: ' + red(error))
             reject(new Error(error))
           } else if (tokens) {
-            console.log(`\n✓ Codex authenticated as ${tokens.email}`)
+            console.log('\n' + checkmark() + ' ' + green(`Codex authenticated as ${tokens.email}`))
             resolve()
           }
         })
       })
     } else {
-      console.error(`Unknown provider: ${provider}. Use: claude | codex`)
-      console.error('For the third slot (OpenAI-compatible), use:')
+      console.error(cross() + ` Unknown provider: ${provider}. Use: claude | codex`)
+      console.error(dim('For the third slot (OpenAI-compatible):'))
       console.error('  pj config set oai_api_key <key>')
       console.error('  pj config preset <deepseek|kimi|glm|qwen|minimax|groq|mistral|xai|...>')
       process.exit(1)
@@ -300,24 +432,50 @@ program
     const oaiKey = getOAIKey()
     const config = readConfig()
 
-    const oaiLabel = getOAIDisplayName()
-    const oaiModel = getOAIModel()
-    const oaiBase = getOAIBaseUrl()
-
-    console.log('\nProvider Status:')
-    console.log(`  Claude   ${claude ? `✓ authenticated (model: ${config.claude_model ?? 'claude-opus-4-7'}${config.claude_web_search ? ' +web' : ''}${config.claude_agent ? ' +agent' : ''})` : '✗ not authenticated — run: pj login claude'}`)
-    console.log(`  Codex    ${codex ? `✓ authenticated as ${codex.email} (model: ${config.codex_model ?? 'gpt-5.4'}${config.codex_web_search ? ' +web' : ''}${config.codex_agent ? ' +agent' : ''})` : '✗ not authenticated — run: pj login codex'}`)
-    if (oaiKey) {
-      const webFlag = (config.oai_web_search ?? config.openrouter_web_search) ? ' +web' : ''
-      const agentFlag = (config.oai_agent ?? config.openrouter_agent) ? ' +agent' : ''
-      console.log(`  OAI      ✓ ${oaiLabel} (model: ${oaiModel}${webFlag}${agentFlag})`)
-      console.log(`           base_url: ${oaiBase}`)
-    } else {
-      console.log('  OAI      ✗ not set — run: pj config set oai_api_key <key>')
-      console.log('             then pick a provider: pj config preset <deepseek|kimi|glm|qwen|...>')
-    }
     console.log()
-    console.log(`  Default judge: ${config.default_judge ?? 'rotate'}`)
+    console.log(bold('Provider status'))
+    console.log(divider())
+
+    // Claude
+    if (claude) {
+      const flags = [
+        config.claude_web_search ? cyan('+web') : '',
+        config.claude_agent ? magenta('+agent') : '',
+      ].filter(Boolean).join(' ')
+      console.log(`  ${checkmark()} ${providerTag('claude')} ${green('authenticated')}  ${dim('model=')}${config.claude_model ?? 'claude-opus-4-7'}${flags ? '  ' + flags : ''}`)
+    } else {
+      console.log(`  ${cross()} ${providerTag('claude')} ${red('not authenticated')}  ${dim('→ pj login claude')}`)
+    }
+
+    // Codex
+    if (codex) {
+      const flags = [
+        config.codex_web_search ? cyan('+web') : '',
+        config.codex_agent ? magenta('+agent') : '',
+      ].filter(Boolean).join(' ')
+      console.log(`  ${checkmark()} ${providerTag('codex')} ${green(codex.email)}  ${dim('model=')}${config.codex_model ?? 'gpt-5.4'}${flags ? '  ' + flags : ''}`)
+    } else {
+      console.log(`  ${cross()} ${providerTag('codex')} ${red('not authenticated')}  ${dim('→ pj login codex')}`)
+    }
+
+    // OAI
+    if (oaiKey) {
+      const label = getOAIDisplayName()
+      const model = getOAIModel()
+      const base = getOAIBaseUrl()
+      const web = (config.oai_web_search ?? config.openrouter_web_search) ? cyan('+web') : ''
+      const agent = (config.oai_agent ?? config.openrouter_agent) ? magenta('+agent') : ''
+      const flags = [web, agent].filter(Boolean).join(' ')
+      console.log(`  ${checkmark()} ${providerTag('oai')} ${green(label)}  ${dim('model=')}${model}${flags ? '  ' + flags : ''}`)
+      console.log(`  ${' '.repeat(4)}${dim('base_url: ')}${dim(base)}`)
+    } else {
+      console.log(`  ${cross()} ${providerTag('oai')} ${red('not set')}  ${dim('→ pj config set oai_api_key <key>')}`)
+      console.log(`  ${' '.repeat(4)}${dim('          then:')} pj config preset ${dim('<deepseek|kimi|glm|qwen|...>')}`)
+    }
+
+    console.log()
+    console.log(kv('judge', yellow(config.default_judge ?? 'rotate')))
+    console.log()
   })
 
 // ── pj config ───────────────────────────────────────────────────────────────
@@ -367,8 +525,8 @@ program
       .description('Set a config value')
       .action((key: string, value: string) => {
         if (!ALLOWED_CONFIG_KEYS.includes(key as typeof ALLOWED_CONFIG_KEYS[number])) {
-          console.error(`Unknown config key: ${key}`)
-          console.error(`Allowed keys: ${ALLOWED_CONFIG_KEYS.join(', ')}`)
+          console.error(cross() + ` Unknown config key: ${key}`)
+          console.error(dim('Allowed keys: ') + ALLOWED_CONFIG_KEYS.join(', '))
           process.exit(1)
         }
         if (BOOLEAN_CONFIG_KEYS.has(key)) {
@@ -376,7 +534,7 @@ program
         } else {
           setConfigValue(key as any, value)
         }
-        console.log(`✓ Set ${key}`)
+        console.log(checkmark() + ' Set ' + bold(key))
       }),
   )
   .addCommand(
@@ -393,7 +551,23 @@ program
           oai_api_key: config.oai_api_key ? '[set]' : undefined,
           openrouter_api_key: config.openrouter_api_key ? '[set]' : undefined,
         }
-        console.log(JSON.stringify(safe, null, 2))
+        // Pretty-print: heading + two-column dim-key / colored-value
+        console.log()
+        console.log(bold('Current config') + dim(' (~/.triptych/config.json)'))
+        console.log(divider())
+        const rows = Object.entries(safe)
+          .filter(([, v]) => v !== undefined)
+          .sort(([a], [b]) => a.localeCompare(b))
+        const keyWidth = Math.min(32, Math.max(14, ...rows.map(([k]) => k.length)) + 2)
+        for (const [k, v] of rows) {
+          const rendered =
+            typeof v === 'boolean' ? (v ? green('true') : red('false')) :
+            typeof v === 'number' ? yellow(String(v)) :
+            typeof v === 'string' ? cyan(v) :
+            dim(JSON.stringify(v))
+          console.log('  ' + dim(k.padEnd(keyWidth)) + rendered)
+        }
+        console.log()
       }),
   )
   .addCommand(
@@ -403,41 +577,54 @@ program
       .option('--keep-model', 'Keep the currently-configured oai_model instead of switching to the preset default')
       .action((name: string | undefined, opts: { keepModel?: boolean }) => {
         if (!name) {
-          console.log('\nAvailable presets (pj config preset <name>):\n')
-          const rows = OAI_PRESETS.map(p => [
-            p.name.padEnd(14),
-            p.display_name.padEnd(26),
-            p.base_url.padEnd(54),
-            p.default_model,
-          ])
-          for (const r of rows) console.log('  ' + r.join('  '))
-          console.log(`\nDefault (no preset applied): ${DEFAULT_OAI_BASE_URL}  model=${DEFAULT_OAI_MODEL}`)
-          console.log('\nAfter selecting a preset, set your API key:')
-          console.log('  pj config set oai_api_key <your-key>')
+          console.log()
+          console.log(bold('Available presets') + dim('  (pj config preset <name>)'))
+          console.log(divider())
+          const nameW = Math.max(12, ...OAI_PRESETS.map(p => p.name.length))
+          const labelW = Math.max(18, ...OAI_PRESETS.map(p => p.display_name.length))
+          const urlW = Math.max(36, ...OAI_PRESETS.map(p => p.base_url.length))
+          for (const p of OAI_PRESETS) {
+            console.log(
+              '  ' +
+              yellow(p.name.padEnd(nameW)) + '  ' +
+              p.display_name.padEnd(labelW) + '  ' +
+              dim(p.base_url.padEnd(urlW)) + '  ' +
+              cyan(p.default_model),
+            )
+          }
+          console.log()
+          console.log(dim(`Default (no preset applied): ${DEFAULT_OAI_BASE_URL}  model=${DEFAULT_OAI_MODEL}`))
+          console.log()
+          console.log(dim('After selecting a preset, set your API key:'))
+          console.log('  ' + cyan('pj config set oai_api_key <your-key>'))
+          console.log()
           return
         }
         try {
           const preset = applyOAIPreset(name, { overrideModel: !opts.keepModel })
-          console.log(`✓ Applied preset "${preset.name}" (${preset.display_name})`)
-          console.log(`  oai_base_url = ${preset.base_url}`)
-          console.log(`  oai_model    = ${opts.keepModel ? getOAIModel() : preset.default_model}`)
+          console.log()
+          console.log(checkmark() + ` Applied preset ${bold(preset.name)}  ${dim('(' + preset.display_name + ')')}`)
+          console.log(kv('base_url', cyan(preset.base_url)))
+          console.log(kv('model',    cyan(opts.keepModel ? getOAIModel() : preset.default_model)))
           const key = getOAIKey()
           if (!key) {
-            console.log('\nNext: pj config set oai_api_key <your-key>')
+            console.log()
+            console.log(dim('Next: ') + cyan('pj config set oai_api_key <your-key>'))
           }
+          console.log()
         } catch (err) {
-          console.error(`✗ ${(err as Error).message}`)
+          console.error(cross() + ' ' + red((err as Error).message))
           process.exit(1)
         }
       }),
   )
   .addCommand(
     new Command('presets')
-      .description('List all built-in presets')
+      .description('List all built-in presets (alias of `config preset`)')
       .action(() => {
         for (const p of OAI_PRESETS) {
-          console.log(`${p.name.padEnd(14)}  ${p.display_name.padEnd(26)}  ${p.base_url}`)
-          console.log(`${''.padEnd(14)}  default model: ${p.default_model}`)
+          console.log(yellow(p.name.padEnd(14)) + '  ' + p.display_name.padEnd(26) + '  ' + dim(p.base_url))
+          console.log(' '.repeat(14) + '  ' + dim('default model: ') + cyan(p.default_model))
         }
       }),
   )
