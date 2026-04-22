@@ -587,146 +587,256 @@ function noteText(lines: React.ReactNode[]): React.ReactNode {
   )
 }
 
-// ── Tab-completion ──────────────────────────────────────────────────────────
+// ── Suggestion engine ───────────────────────────────────────────────────────
+//
+// Two surfaces consume the same data:
+// 1. Live suggestions: an inline dropdown below the input that appears the
+//    moment the user types `/`. Context-aware — cascades through command →
+//    subcommand → value.
+// 2. Legacy Tab completion: kept for completeness but subsumed by the live
+//    list (Tab on a live list just picks the highlighted item).
+//
+// Each command/value entry carries a short description so the dropdown is
+// self-documenting (like Claude Code's PromptInputFooterSuggestions).
 
-const SLASH_COMMANDS = [
-  'help', 'status', 'thread',
-  'new', 'clear', 'reset',
-  'login',
-  'providers', 'judge', 'verbose',
-  'config', 'preset',
-  'exit', 'quit',
-] as const
+interface CommandDef {
+  name: string
+  description: string
+  aliasOf?: string  // rendered as "alias of /<aliasOf>" in the dropdown
+}
 
-const CONFIG_SUBS = ['show', 'set', 'preset'] as const
-const JUDGE_VALUES = ['rotate', 'claude', 'codex', 'oai', 'vote'] as const
-const PROVIDER_VALUES = ['claude', 'codex', 'oai'] as const
-const LOGIN_VALUES = ['claude', 'codex'] as const
-const CONFIG_KEYS = [
-  'oai_api_key', 'oai_base_url', 'oai_model',
-  'oai_web_search', 'oai_agent', 'oai_display_name',
-  'claude_model', 'claude_web_search', 'claude_agent',
-  'codex_model', 'codex_web_search', 'codex_agent',
-  'default_judge',
-] as const
+const COMMAND_DEFS: CommandDef[] = [
+  { name: 'help',      description: 'show commands and keybinds' },
+  { name: 'status',    description: 'provider authentication and config status' },
+  { name: 'thread',    description: 'show how many prior turns are threaded as context' },
+  { name: 'new',       description: 'start a fresh conversation thread' },
+  { name: 'clear',     description: 'clear transcript and conversation', aliasOf: 'new' },
+  { name: 'reset',     description: 'clear transcript and conversation', aliasOf: 'new' },
+  { name: 'login',     description: 'OAuth for claude or codex' },
+  { name: 'providers', description: 'set active providers for this session' },
+  { name: 'judge',     description: 'set judge strategy' },
+  { name: 'verbose',   description: 'toggle verbose mode' },
+  { name: 'config',    description: 'manage configuration' },
+  { name: 'preset',    description: 'apply an OpenAI-compatible endpoint preset' },
+  { name: 'exit',      description: 'exit triptych' },
+  { name: 'quit',      description: 'exit triptych', aliasOf: 'exit' },
+]
 
-interface CompletionResult {
-  /** If unique completion found, the full input to replace with. */
-  match?: string
-  /** If multiple candidates, the list to show. */
-  suggestions?: string[]
+const CONFIG_SUBS: Array<{ name: string; description: string }> = [
+  { name: 'show',   description: 'print saved configuration (secrets redacted)' },
+  { name: 'set',    description: 'persist a config value' },
+  { name: 'preset', description: 'list or apply a provider preset' },
+]
+
+const JUDGE_VALUES: Array<{ name: string; description: string }> = [
+  { name: 'rotate', description: 'round-robin (recommended)' },
+  { name: 'claude', description: 'pin claude as judge' },
+  { name: 'codex',  description: 'pin codex as judge' },
+  { name: 'oai',    description: 'pin the OpenAI-compatible slot as judge' },
+  { name: 'vote',   description: 'all three judge in parallel, outputs concatenated' },
+]
+
+const PROVIDER_VALUES: Array<{ name: string; description: string }> = [
+  { name: 'claude', description: 'Anthropic (OAuth)' },
+  { name: 'codex',  description: 'ChatGPT (OAuth)' },
+  { name: 'oai',    description: 'OpenAI-compatible endpoint (API key)' },
+]
+
+const LOGIN_VALUES = PROVIDER_VALUES.filter(p => p.name !== 'oai')
+
+const CONFIG_KEYS: Array<{ name: string; description: string }> = [
+  { name: 'oai_api_key',      description: 'API key for the OpenAI-compatible endpoint' },
+  { name: 'oai_base_url',     description: 'endpoint base URL' },
+  { name: 'oai_model',        description: 'model id for the endpoint' },
+  { name: 'oai_web_search',   description: 'append `:online` (OpenRouter only)' },
+  { name: 'oai_agent',        description: 'enable multi-turn agent mode' },
+  { name: 'oai_display_name', description: 'friendly label in status' },
+  { name: 'claude_model',     description: 'Anthropic model id' },
+  { name: 'claude_web_search',description: 'enable Claude server-side web search' },
+  { name: 'claude_agent',     description: 'enable Claude agent mode' },
+  { name: 'codex_model',      description: 'Codex model id' },
+  { name: 'codex_web_search', description: 'enable Codex server-side web search' },
+  { name: 'codex_agent',      description: 'enable Codex agent mode' },
+  { name: 'default_judge',    description: 'default judge strategy' },
+]
+
+/**
+ * Suggestion item used by both the dropdown and Tab. `fullLine` is the new
+ * input line to set when the user picks this item.
+ */
+export interface SuggestionItem {
+  value: string
+  fullLine: string
+  description?: string
 }
 
 /**
- * Expand a partial slash command to its best completion.
- *
- * Rules:
- * - Single word starting with `/`  → complete command name.
- * - `/config <partial>`            → complete subcommand (show | set | preset).
- * - `/config preset <partial>` or `/preset <partial>`  → complete preset name.
- * - `/config set <partial>`        → complete config key.
- * - `/judge <partial>`             → complete strategy.
- * - `/providers <partial>`        → complete the last comma-separated token.
- * - `/login <partial>`            → complete claude | codex.
+ * Context-aware list of suggestions for the current input. Returns an empty
+ * array when the input is not in a completable state.
  */
-export function completeSlash(input: string): CompletionResult {
-  if (!input.startsWith('/')) return {}
+export function getSuggestions(input: string): SuggestionItem[] {
+  if (!input.startsWith('/')) return []
   const trailingSpace = /\s$/.test(input)
   const words = input.slice(1).trim().split(/\s+/).filter(Boolean)
 
-  // First-word completion: user is still typing the command name.
+  // Top-level command
   if (words.length <= 1 && !trailingSpace) {
     const partial = words[0] ?? ''
-    return suggest(partial, [...SLASH_COMMANDS], p => `/${p}`, { space: true })
+    return filterPool(COMMAND_DEFS, partial).map(c => ({
+      value: c.name,
+      description: c.aliasOf ? `${c.description}` : c.description,
+      fullLine: `/${c.name}`,
+    }))
   }
 
   const head = words[0]
 
   if (head === 'config') {
-    // /config <sub> ...
     if (words.length === 1 || (words.length === 2 && !trailingSpace)) {
       const partial = words[1] ?? ''
-      return suggest(partial, [...CONFIG_SUBS], p => `/config ${p}`, { space: true })
+      return filterPool(CONFIG_SUBS, partial).map(s => ({
+        value: s.name,
+        description: s.description,
+        fullLine: `/config ${s.name}`,
+      }))
     }
     const sub = words[1]
     if (sub === 'preset') {
       const partial = trailingSpace && words.length === 2 ? '' : (words[2] ?? '')
-      return suggest(partial, OAI_PRESETS.map(p => p.name), p => `/config preset ${p}`)
+      return filterPool(OAI_PRESETS.map(p => ({ name: p.name, description: p.display_name })), partial).map(p => ({
+        value: p.name,
+        description: p.description,
+        fullLine: `/config preset ${p.name}`,
+      }))
     }
     if (sub === 'set') {
       const partial = trailingSpace && words.length === 2 ? '' : (words[2] ?? '')
-      if (words.length <= 3) return suggest(partial, [...CONFIG_KEYS], p => `/config set ${p}`, { space: true })
+      if (words.length <= 3) {
+        return filterPool(CONFIG_KEYS, partial).map(k => ({
+          value: k.name,
+          description: k.description,
+          fullLine: `/config set ${k.name} `,
+        }))
+      }
     }
-    return {}
+    return []
   }
 
   if (head === 'preset') {
     const partial = trailingSpace && words.length === 1 ? '' : (words[1] ?? '')
-    return suggest(partial, OAI_PRESETS.map(p => p.name), p => `/preset ${p}`)
+    return filterPool(OAI_PRESETS.map(p => ({ name: p.name, description: p.display_name })), partial).map(p => ({
+      value: p.name,
+      description: p.description,
+      fullLine: `/preset ${p.name}`,
+    }))
   }
 
   if (head === 'judge') {
     const partial = trailingSpace && words.length === 1 ? '' : (words[1] ?? '')
-    return suggest(partial, [...JUDGE_VALUES], p => `/judge ${p}`)
+    return filterPool(JUDGE_VALUES, partial).map(j => ({
+      value: j.name,
+      description: j.description,
+      fullLine: `/judge ${j.name}`,
+    }))
   }
 
   if (head === 'login') {
     const partial = trailingSpace && words.length === 1 ? '' : (words[1] ?? '')
-    return suggest(partial, [...LOGIN_VALUES], p => `/login ${p}`)
+    return filterPool(LOGIN_VALUES, partial).map(p => ({
+      value: p.name,
+      description: p.description,
+      fullLine: `/login ${p.name}`,
+    }))
   }
 
   if (head === 'providers') {
-    // Comma-separated. Complete just the last comma-token.
     const rest = words.slice(1).join(' ') + (trailingSpace ? ' ' : '')
     const parts = rest.split(',')
     const last = (parts[parts.length - 1] ?? '').trimStart()
-    return suggest(
-      last,
-      [...PROVIDER_VALUES],
-      p => `/providers ${parts.slice(0, -1).concat([p]).join(',')}`,
-    )
+    return filterPool(PROVIDER_VALUES, last).map(p => ({
+      value: p.name,
+      description: p.description,
+      fullLine: `/providers ${parts.slice(0, -1).concat([p.name]).join(',')}`,
+    }))
   }
 
-  return {}
+  return []
+}
+
+function filterPool<T extends { name: string }>(pool: T[], partial: string): T[] {
+  if (!partial) return pool
+  const p = partial.toLowerCase()
+  return pool.filter(item => item.name.toLowerCase().startsWith(p))
+}
+
+// ── Live suggestion dropdown (below the input) ──────────────────────────────
+//
+// Claude-Code-style: the moment the user types `/`, a compact list appears
+// right under the input box showing matching commands + descriptions. Arrow
+// keys move the selection; Tab (or Enter) commits the highlighted item into
+// the input. Max 8 rows visible — paged centered on the selection.
+
+const SUGG_MAX_VISIBLE = 8
+
+function SuggestionsList({
+  items,
+  selected,
+}: {
+  items: SuggestionItem[]
+  selected: number
+}): JSX.Element | null {
+  if (items.length === 0) return null
+  const half = Math.floor(SUGG_MAX_VISIBLE / 2)
+  const start = Math.max(0, Math.min(selected - half, items.length - SUGG_MAX_VISIBLE))
+  const end = Math.min(items.length, start + SUGG_MAX_VISIBLE)
+  const visible = items.slice(start, end)
+  const nameColW = Math.min(20, Math.max(8, ...items.map(i => i.value.length)) + 2)
+
+  return (
+    <Box flexDirection="column" paddingLeft={3} marginTop={0}>
+      {visible.map((item, i) => {
+        const abs = start + i
+        const isSel = abs === selected
+        return (
+          <Box key={item.value}>
+            <Text color={isSel ? COLORS.accent : undefined} dimColor={!isSel}>
+              {isSel ? '❯ ' : '  '}
+            </Text>
+            <Box width={nameColW}>
+              <Text color={isSel ? COLORS.accent : undefined} dimColor={!isSel} bold={isSel}>
+                {item.value}
+              </Text>
+            </Box>
+            {item.description ? (
+              <Text dimColor>{item.description}</Text>
+            ) : null}
+          </Box>
+        )
+      })}
+      {items.length > SUGG_MAX_VISIBLE ? (
+        <Box>
+          <Text dimColor>  …{items.length - SUGG_MAX_VISIBLE} more (↑↓ to scroll)</Text>
+        </Box>
+      ) : null}
+    </Box>
+  )
 }
 
 /**
- * Three-way result:
- * - unique completion  → `{ match: <full line> }`
- * - LCP-extensible     → `{ match: <full line with LCP>, suggestions: […candidates] }`
- * - ambiguous at LCP   → `{ suggestions: […candidates] }`
- *
- * `opts.space` means "append a trailing space on a UNIQUE completion"
- * (because another argument is expected). The LCP extension never gets
- * a trailing space — you're still completing the same token.
+ * Tab-completion shim kept for backwards-compatible unit-test callers.
+ * Returns the same shape as before but derives its pool from getSuggestions().
  */
-function suggest(
-  partial: string,
-  pool: string[],
-  build: (candidate: string) => string,
-  opts: { space?: boolean } = {},
-): CompletionResult {
-  const matches = pool.filter(p => p.startsWith(partial))
-  if (matches.length === 0) return {}
-  if (matches.length === 1) {
-    const full = build(matches[0]!)
-    return { match: opts.space ? full + ' ' : full }
+export function completeSlash(input: string): { match?: string; suggestions?: string[] } {
+  const items = getSuggestions(input)
+  if (items.length === 0) return {}
+  if (items.length === 1) {
+    // Add trailing space when more arguments are expected for this command.
+    const only = items[0]!
+    const needsSpace = /^\/(config|preset|judge|providers|login)$/.test(only.fullLine)
+      || only.fullLine.endsWith('set')
+    return { match: needsSpace ? only.fullLine + ' ' : only.fullLine }
   }
-  const lcp = longestCommonPrefix(matches)
-  if (lcp.length > partial.length) return { match: build(lcp), suggestions: matches }
-  return { suggestions: matches }
-}
-
-function longestCommonPrefix(xs: string[]): string {
-  if (xs.length === 0) return ''
-  let prefix = xs[0]!
-  for (const s of xs.slice(1)) {
-    let i = 0
-    while (i < prefix.length && i < s.length && prefix[i] === s[i]) i++
-    prefix = prefix.slice(0, i)
-    if (!prefix) break
-  }
-  return prefix
+  return { suggestions: items.map(i => i.value) }
 }
 
 function handleCommand(raw: string, ctx: CommandContext): void {
@@ -1099,6 +1209,17 @@ function App(): JSX.Element {
   const historyIdx = useRef<number | null>(null)
   const draft = useRef('')
 
+  // Live suggestions dropdown (slash commands).
+  const suggestions = !debate.running && input.startsWith('/')
+    ? getSuggestions(input)
+    : []
+  const hasSuggestions = suggestions.length > 0
+  const [suggSelected, setSuggSelected] = useState(0)
+  // Reset selection whenever the item set changes so the highlight stays in
+  // bounds as the user types.
+  const suggKey = suggestions.map(s => s.value).join('\x00')
+  useEffect(() => { setSuggSelected(0) }, [suggKey])
+
   // True while a spawned child (/login) owns stdio and Ink is suspended.
   const [suspended, setSuspended] = useState(false)
 
@@ -1137,8 +1258,35 @@ function App(): JSX.Element {
       return
     }
 
-    // History navigation — only while idle and when there's something to browse.
     if (debate.running) return
+
+    // ── Suggestions dropdown takes precedence over history navigation ──
+    if (hasSuggestions) {
+      if (key.upArrow) {
+        setSuggSelected(i => (i - 1 + suggestions.length) % suggestions.length)
+        return
+      }
+      if (key.downArrow) {
+        setSuggSelected(i => (i + 1) % suggestions.length)
+        return
+      }
+      if (key.tab) {
+        // Fill the input with the selected suggestion. Don't submit — user
+        // can keep typing arguments or press Enter explicitly.
+        const chosen = suggestions[suggSelected]
+        if (chosen) setInput(chosen.fullLine)
+        historyIdx.current = null
+        return
+      }
+      if (key.escape) {
+        // Quickest "dismiss" gesture: clear input. Ideally we'd toggle a
+        // "suppressed" flag, but clearing is simple and unambiguous.
+        setInput('')
+        return
+      }
+    }
+
+    // ── History navigation (only when the dropdown isn't showing) ──
     if (key.upArrow) {
       if (history.length === 0) return
       if (historyIdx.current === null) {
@@ -1162,36 +1310,9 @@ function App(): JSX.Element {
       return
     }
 
-    // Tab completion — slash-prefixed input only (plain task text passes through).
-    if (key.tab) {
-      if (!input.startsWith('/')) return
-      const result = completeSlash(input)
-      // Fill the input with the longest unambiguous completion (unique or LCP).
-      if (result.match !== undefined && result.match !== input) {
-        setInput(result.match)
-        historyIdx.current = null
-      }
-      // Show candidates whenever more than one is possible — even when we also
-      // advanced the input, so the user sees what the remaining choices are.
-      if (result.suggestions && result.suggestions.length > 1) {
-        addEntry({
-          id: nextId(),
-          kind: 'note',
-          content: (
-            <Box>
-              <Text>  </Text>
-              {result.suggestions.map((s, i) => (
-                <React.Fragment key={i}>
-                  {i > 0 ? <Text dimColor>  ·  </Text> : null}
-                  <Text color={COLORS.accent}>{s}</Text>
-                </React.Fragment>
-              ))}
-            </Box>
-          ),
-        })
-      }
-      return
-    }
+    // Tab on non-slash input: no-op. (The live dropdown handles all slash
+    // completion now.)
+    if (key.tab) return
 
     // Any keystroke other than up/down/tab abandons history browsing so the
     // next up/down starts from a fresh "current draft" anchor.
@@ -1511,7 +1632,7 @@ function App(): JSX.Element {
         </Box>
       ) : null}
 
-      <Box marginTop={1}>
+      <Box marginTop={1} flexDirection="column">
         <InputBox
           value={input}
           onChange={setInput}
@@ -1519,6 +1640,9 @@ function App(): JSX.Element {
           disabled={debate.running || suspended}
           placeholder={debate.running ? '(running — ctrl-c to cancel)' : 'type a task or /help'}
         />
+        {hasSuggestions ? (
+          <SuggestionsList items={suggestions} selected={suggSelected} />
+        ) : null}
       </Box>
     </Box>
   )
