@@ -371,6 +371,9 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }): JSX.Element {
 // one provider row per line with tinted tag + model + auth state. No emoji,
 // no mascot — the visual weight is carried by the frame itself.
 
+const CARD_MAX_WIDTH = 64   // Claude Code uses LEFT_PANEL_MAX_WIDTH = 50; 64
+                             // leaves a bit more room for Chinese email chars.
+
 function Welcome({ session }: { session: SessionConfig }): JSX.Element {
   const claude = getClaudeTokens()
   const codex = getCodexTokens()
@@ -378,43 +381,39 @@ function Welcome({ session }: { session: SessionConfig }): JSX.Element {
   const config = readConfig()
   const { stdout } = useStdout()
   const cols = stdout?.columns ?? 80
-  // Cap at 88 cols so the card doesn't stretch absurdly on ultra-wide terms.
-  const cardWidth = Math.min(cols - 2, 88)
+  const cardWidth = Math.min(Math.max(cols - 4, 40), CARD_MAX_WIDTH)
+
+  // Top rule with title embedded — Claude-Code-style. Title padded with one
+  // extra space on each side for breathing room; trailing dashes fill the
+  // remaining width up to the top-right corner.
+  const titleText = ' triptych 0.2.0 '  // leading/trailing space → visual padding
+  const titleWidth = titleText.length
+  const trailing = Math.max(0, cardWidth - 2 /*╭╮*/ - 2 /*── before title*/ - titleWidth)
 
   return (
     <Box flexDirection="column" marginTop={1}>
-      {/* Title strip overlaid on the top edge of the bordered card: Claude-
-          Code-style "╭─ triptych 0.2.0 ──────────────────────╮" look. Vanilla
-          Ink doesn't support the `borderText` prop (that's a Claude Code
-          fork), so we draw the top line ourselves with raw box-drawing glyphs
-          and stitch it to a Box that renders only the sides and bottom. */}
+      {/* Title row drawn by hand because vanilla Ink (v5) has no borderText. */}
       <Box width={cardWidth}>
-        <Text dimColor>{'╭─ '}</Text>
-        <Text bold color={COLORS.accent}>triptych</Text>
-        <Text dimColor>{' 0.2.0 '}</Text>
-        <Text dimColor>{'─'.repeat(Math.max(0, cardWidth - 'triptych'.length - ' 0.2.0 '.length - 5))}</Text>
+        <Text dimColor>{'╭──'}</Text>
+        <Text bold color={COLORS.accent}>{titleText}</Text>
+        <Text dimColor>{'─'.repeat(trailing)}</Text>
         <Text dimColor>{'╮'}</Text>
       </Box>
+
       <Box
         borderStyle="round"
         borderColor={COLORS.accent}
         borderDimColor
         borderTop={false}
         paddingX={2}
-        paddingY={1}
         flexDirection="column"
         width={cardWidth}
       >
-        {/* Subtitle (was the right side of the old title row) */}
+        {/* Session meta — providers left, judge right */}
         <Box>
-          <Text dimColor>three-model planning debate</Text>
-        </Box>
-
-        {/* Provider lineup */}
-        <Box marginTop={1}>
           {PROVIDER_ORDER.map((p, i) => (
             <React.Fragment key={p}>
-              {i > 0 ? <Text dimColor>  ·  </Text> : null}
+              {i > 0 ? <Text dimColor>{' · '}</Text> : null}
               <Text color={providerHex(p)}>{p}</Text>
             </React.Fragment>
           ))}
@@ -423,7 +422,7 @@ function Welcome({ session }: { session: SessionConfig }): JSX.Element {
           <Text color={COLORS.accent}>{session.judge}</Text>
         </Box>
 
-        {/* Provider status rows */}
+        {/* Provider status rows — single rule of three, no blank separators */}
         <Box flexDirection="column" marginTop={1}>
           <ProviderRow
             name="claude"
@@ -436,30 +435,31 @@ function Welcome({ session }: { session: SessionConfig }): JSX.Element {
             name="codex"
             ok={codex !== null}
             detail={codex
-              ? <><Text dimColor>{config.codex_model ?? 'gpt-5.4'}</Text><Text dimColor>  ·  </Text><Text dimColor>{codex.email}</Text></>
+              ? <><Text dimColor>{config.codex_model ?? 'gpt-5.4'}</Text><Text dimColor>{' · '}</Text><Text dimColor>{codex.email}</Text></>
               : <Text dimColor>/login codex</Text>}
           />
           <ProviderRow
             name="oai"
             ok={oaiKey !== null}
             detail={oaiKey
-              ? <><Text dimColor>{getOAIModel()}</Text><Text dimColor>  ·  </Text><Text dimColor>{getOAIDisplayName()}</Text></>
+              ? <><Text dimColor>{getOAIModel()}</Text><Text dimColor>{' · '}</Text><Text dimColor>{getOAIDisplayName()}</Text></>
               : <Text dimColor>/preset {'<deepseek|kimi|glm|…>'}</Text>}
           />
         </Box>
       </Box>
 
-      {/* Outside the card: minimal help hint, single dim line */}
-      <Box marginTop={1} paddingX={1}>
+      {/* Single-line help hint below the card. Indent matches the card's
+          content column (1 for the border + 2 for paddingX). */}
+      <Box marginTop={1} paddingLeft={3}>
         <Text dimColor>Type a task, or </Text>
         <Text color={COLORS.accent}>/help</Text>
-        <Text dimColor> for commands. </Text>
+        <Text dimColor>{' · '}</Text>
         <Text color={COLORS.accent}>↑↓</Text>
-        <Text dimColor> history · </Text>
+        <Text dimColor> history</Text>
+        <Text dimColor>{' · '}</Text>
         <Text color={COLORS.accent}>tab</Text>
-        <Text dimColor> complete · </Text>
-        <Text color={COLORS.accent}>ctrl-c</Text>
-        <Text dimColor> cancel · </Text>
+        <Text dimColor> complete</Text>
+        <Text dimColor>{' · '}</Text>
         <Text color={COLORS.accent}>ctrl-d</Text>
         <Text dimColor> exit</Text>
       </Box>
@@ -479,9 +479,9 @@ function ProviderRow({
   return (
     <Box>
       <Text color={ok ? COLORS.ok : COLORS.err}>{ok ? '✓' : '×'}</Text>
-      <Text>  </Text>
-      <Box width={8}><Text color={providerHex(name)}>{name}</Text></Box>
-      <Text>  </Text>
+      <Text> </Text>
+      <Box width={7}><Text color={providerHex(name)}>{name}</Text></Box>
+      <Text> </Text>
       {detail as any}
     </Box>
   )
@@ -512,7 +512,8 @@ function InputBox({
   const color = disabled ? 'gray' : COLORS.accent
   const { stdout } = useStdout()
   const cols = stdout?.columns ?? 80
-  const width = Math.min(cols - 2, 88)
+  // Match welcome card width so the rules align visually with the card.
+  const width = Math.min(Math.max(cols - 4, 40), CARD_MAX_WIDTH)
   return (
     <Box
       flexDirection="row"
@@ -1475,7 +1476,7 @@ function App(): JSX.Element {
   ]
 
   return (
-    <Box flexDirection="column" paddingX={1}>
+    <Box flexDirection="column">
       <Static items={staticItems}>
         {(item, idx) => (
           <Box key={idx} flexDirection="column">
