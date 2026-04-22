@@ -49,6 +49,11 @@ const program = new Command()
   .name('triptych')
   .description('Three-model planning debate: Claude × Codex × any OpenAI-compatible model. Aliased as `pj`.')
   .version('0.2.0')
+  .action(async () => {
+    // No subcommand → launch the interactive TUI (Claude-Code-style shell).
+    const { startTUI } = await import('./cli/tui.js')
+    startTUI()
+  })
 
 function installSigintHandler(ac: AbortController, dashboard?: Dashboard): void {
   process.on('SIGINT', () => {
