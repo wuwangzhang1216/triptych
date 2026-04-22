@@ -962,7 +962,7 @@ function handleCommand(raw: string, ctx: CommandContext): void {
         }
         const [presetName] = subRest
         try {
-          const preset = applyOAIPreset(presetName!)
+          const { preset, keyCleared } = applyOAIPreset(presetName!)
           ctx.addEntry({
             id: Date.now(),
             kind: 'note',
@@ -971,6 +971,7 @@ function handleCommand(raw: string, ctx: CommandContext): void {
                 <Box><Text>  <Text color={COLORS.ok}>✓</Text>  applied <Text bold>{preset.name}</Text>  <Text dimColor>{preset.display_name}</Text></Text></Box>
                 <Box><Text dimColor>    base_url  {preset.base_url}</Text></Box>
                 <Box><Text dimColor>    model     {preset.default_model}</Text></Box>
+                {keyCleared ? <Box marginTop={1}><Text color={COLORS.warn}>    ! cleared stale oai_api_key (different endpoint)</Text></Box> : null}
                 {!getOAIKey() ? <Box marginTop={1}><Text dimColor>    next: /config set oai_api_key &lt;key&gt;</Text></Box> : null}
               </>
             ),
@@ -991,7 +992,7 @@ function handleCommand(raw: string, ctx: CommandContext): void {
         return
       }
       try {
-        const preset = applyOAIPreset(arg)
+        const { preset, keyCleared } = applyOAIPreset(arg)
         ctx.addEntry({
           id: Date.now(),
           kind: 'note',
@@ -999,6 +1000,7 @@ function handleCommand(raw: string, ctx: CommandContext): void {
             <>
               <Box><Text>  <Text color={COLORS.ok}>✓</Text>  applied <Text bold>{preset.name}</Text>  <Text dimColor>{preset.display_name}</Text></Text></Box>
               <Box><Text dimColor>    model  {preset.default_model}</Text></Box>
+              {keyCleared ? <Box marginTop={1}><Text color={COLORS.warn}>    ! cleared stale oai_api_key (different endpoint)</Text></Box> : null}
             </>
           ),
         })

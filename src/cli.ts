@@ -577,11 +577,15 @@ program
           return
         }
         try {
-          const preset = applyOAIPreset(name, { overrideModel: !opts.keepModel })
+          const { preset, keyCleared } = applyOAIPreset(name, { overrideModel: !opts.keepModel })
           console.log()
           console.log('  ' + ok('✓') + '  applied ' + bold(preset.name) + dim('  ' + preset.display_name))
           console.log('  ' + dim('base_url  ') + preset.base_url)
           console.log('  ' + dim('model     ') + (opts.keepModel ? getOAIModel() : preset.default_model))
+          if (keyCleared) {
+            console.log()
+            console.log('  ' + warn('!') + '  cleared stale oai_api_key (different endpoint)')
+          }
           if (!getOAIKey()) {
             console.log()
             console.log('  ' + dim('next:  ') + 'pj config set oai_api_key <key>')

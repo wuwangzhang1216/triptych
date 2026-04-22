@@ -186,7 +186,12 @@ export const DEFAULT_OAI_MODEL = 'minimax/minimax-m2.7'
 
 export function getOAIKey(): string | null {
   const c = readConfig()
-  return c.oai_api_key ?? c.openrouter_api_key ?? null
+  if (c.oai_api_key) return c.oai_api_key
+  // Legacy fallback: openrouter_api_key only makes sense when the endpoint is
+  // actually OpenRouter. Don't carry it across to other vendors.
+  const baseUrl = c.oai_base_url ?? DEFAULT_OAI_BASE_URL
+  if (baseUrl.includes('openrouter.ai') && c.openrouter_api_key) return c.openrouter_api_key
+  return null
 }
 
 export function getOAIBaseUrl(): string {
@@ -289,24 +294,37 @@ export function findOAIPreset(name: string): OAIPreset | undefined {
   return OAI_PRESETS.find(p => p.name === n)
 }
 
-/** Apply a preset: writes base_url, default model (if user hasn't set one yet), and display_name. API key is never touched. */
-export function applyOAIPreset(name: string, opts: { overrideModel?: boolean } = {}): OAIPreset {
+export interface PresetApplyResult {
+  preset: OAIPreset
+  /** True if the endpoint changed AND we cleared the prior oai_api_key because it belongs to a different vendor. */
+  keyCleared: boolean
+}
+
+/**
+ * Apply a preset: writes base_url, default model, display_name. If the endpoint
+ * is changing, clear oai_api_key — keys are endpoint-scoped and silently
+ * carrying an old one across vendors fails with a confusing 401. Legacy
+ * `openrouter_api_key` fallback still works for the OpenRouter preset.
+ */
+export function applyOAIPreset(name: string, opts: { overrideModel?: boolean } = {}): PresetApplyResult {
   const preset = findOAIPreset(name)
   if (!preset) {
     throw new Error(
       `Unknown preset: "${name}". Available: ${OAI_PRESETS.map(p => p.name).join(', ')}`,
     )
   }
+  const prev = readConfig()
+  const endpointChanged = (prev.oai_base_url ?? DEFAULT_OAI_BASE_URL) !== preset.base_url
+  const hadKey = !!prev.oai_api_key
+  const keyCleared = endpointChanged && hadKey
   writeConfig(c => ({
     ...c,
     oai_base_url: preset.base_url,
     oai_display_name: preset.display_name,
-    // Overwrite the model unless the user explicitly opts out. Different
-    // presets have incompatible model ids, so carrying over an old model id
-    // usually breaks the new endpoint.
     oai_model: (opts.overrideModel === false && c.oai_model)
       ? c.oai_model
       : preset.default_model,
+    oai_api_key: keyCleared ? undefined : c.oai_api_key,
   }))
-  return preset
+  return { preset, keyCleared }
 }
