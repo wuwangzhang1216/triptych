@@ -5,7 +5,7 @@
  */
 
 import React, { useEffect, useReducer, useRef, useState } from 'react'
-import { Box, Static, Text, render, useApp, useInput, useStdin } from 'ink'
+import { Box, Static, Text, render, useApp, useInput, useStdin, useStdout } from 'ink'
 import TextInput from 'ink-text-input'
 import { spawn } from 'node:child_process'
 
@@ -258,7 +258,7 @@ function Row({ row }: { row: RowState }): JSX.Element {
 
   return (
     <Box>
-      <Text>    </Text>
+      <Text>  </Text>
       <Box width={3}>{glyph}</Box>
       <Box width={Math.max(14, row.labelWidth + 2)}>{row.label}</Box>
       <Box width={8} justifyContent="flex-end"><Text dimColor>{elapsedStr}</Text></Box>
@@ -277,10 +277,9 @@ function PhaseView({ phase }: { phase: PhaseState }): JSX.Element {
   return (
     <Box flexDirection="column" marginTop={1}>
       <Box>
-        <Text>  </Text>
         <Text color={COLORS.accent} bold>{phase.id}</Text>
         <Text>  </Text>
-        <Text dimColor>{PHASE_TITLE[phase.id]}</Text>
+        <Text>{PHASE_TITLE[phase.id]}</Text>
         {phase.tail ? (
           <>
             <Text dimColor>  ·  </Text>
@@ -299,13 +298,16 @@ function DebateView({ debate }: { debate: DebateState }): JSX.Element {
   return (
     <Box flexDirection="column">
       <Box>
-        <Text color={COLORS.accent}>› </Text>
+        <Text color={COLORS.accent}>›</Text>
+        <Text> </Text>
         <Text>{debate.task}</Text>
       </Box>
       {debate.phases.map(p => <PhaseView key={p.id} phase={p} />)}
       {debate.error ? (
         <Box marginTop={1}>
-          <Text color={COLORS.err}>  ×  {debate.error}</Text>
+          <Text color={COLORS.err}>×</Text>
+          <Text>  </Text>
+          <Text color={COLORS.err}>{debate.error}</Text>
         </Box>
       ) : null}
     </Box>
@@ -364,91 +366,135 @@ function TranscriptItem({ entry }: { entry: TranscriptEntry }): JSX.Element {
 }
 
 // ── Welcome banner ──────────────────────────────────────────────────────────
+//
+// Claude-Code-style: a rounded border card with subtle accent, compact header,
+// one provider row per line with tinted tag + model + auth state. No emoji,
+// no mascot — the visual weight is carried by the frame itself.
 
 function Welcome({ session }: { session: SessionConfig }): JSX.Element {
   const claude = getClaudeTokens()
   const codex = getCodexTokens()
   const oaiKey = getOAIKey()
   const config = readConfig()
+  const { stdout } = useStdout()
+  const cols = stdout?.columns ?? 80
+  // Cap at 88 cols so the card doesn't stretch absurdly on ultra-wide terms.
+  const cardWidth = Math.min(cols - 2, 88)
 
   return (
-    <Box flexDirection="column" marginTop={1} marginBottom={1}>
-      <Box>
-        <Text>  </Text>
-        <Text bold>triptych</Text>
-        <Text dimColor>  0.2.0</Text>
-        <Text>   </Text>
-        {PROVIDER_ORDER.map((p, i) => (
-          <React.Fragment key={p}>
-            {i > 0 ? <Text dimColor> · </Text> : null}
-            <Text color={providerHex(p)}>{p}</Text>
-          </React.Fragment>
-        ))}
-        <Text dimColor>   judge: </Text>
-        <Text color={COLORS.accent}>{session.judge}</Text>
+    <Box flexDirection="column" marginTop={1}>
+      {/* Title strip overlaid on the top edge of the bordered card: Claude-
+          Code-style "╭─ triptych 0.2.0 ──────────────────────╮" look. Vanilla
+          Ink doesn't support the `borderText` prop (that's a Claude Code
+          fork), so we draw the top line ourselves with raw box-drawing glyphs
+          and stitch it to a Box that renders only the sides and bottom. */}
+      <Box width={cardWidth}>
+        <Text dimColor>{'╭─ '}</Text>
+        <Text bold color={COLORS.accent}>triptych</Text>
+        <Text dimColor>{' 0.2.0 '}</Text>
+        <Text dimColor>{'─'.repeat(Math.max(0, cardWidth - 'triptych'.length - ' 0.2.0 '.length - 5))}</Text>
+        <Text dimColor>{'╮'}</Text>
+      </Box>
+      <Box
+        borderStyle="round"
+        borderColor={COLORS.accent}
+        borderDimColor
+        borderTop={false}
+        paddingX={2}
+        paddingY={1}
+        flexDirection="column"
+        width={cardWidth}
+      >
+        {/* Subtitle (was the right side of the old title row) */}
+        <Box>
+          <Text dimColor>three-model planning debate</Text>
+        </Box>
+
+        {/* Provider lineup */}
+        <Box marginTop={1}>
+          {PROVIDER_ORDER.map((p, i) => (
+            <React.Fragment key={p}>
+              {i > 0 ? <Text dimColor>  ·  </Text> : null}
+              <Text color={providerHex(p)}>{p}</Text>
+            </React.Fragment>
+          ))}
+          <Box flexGrow={1} />
+          <Text dimColor>judge </Text>
+          <Text color={COLORS.accent}>{session.judge}</Text>
+        </Box>
+
+        {/* Provider status rows */}
+        <Box flexDirection="column" marginTop={1}>
+          <ProviderRow
+            name="claude"
+            ok={claude !== null}
+            detail={claude
+              ? <Text dimColor>{config.claude_model ?? 'claude-opus-4-7'}</Text>
+              : <Text dimColor>/login claude</Text>}
+          />
+          <ProviderRow
+            name="codex"
+            ok={codex !== null}
+            detail={codex
+              ? <><Text dimColor>{config.codex_model ?? 'gpt-5.4'}</Text><Text dimColor>  ·  </Text><Text dimColor>{codex.email}</Text></>
+              : <Text dimColor>/login codex</Text>}
+          />
+          <ProviderRow
+            name="oai"
+            ok={oaiKey !== null}
+            detail={oaiKey
+              ? <><Text dimColor>{getOAIModel()}</Text><Text dimColor>  ·  </Text><Text dimColor>{getOAIDisplayName()}</Text></>
+              : <Text dimColor>/preset {'<deepseek|kimi|glm|…>'}</Text>}
+          />
+        </Box>
       </Box>
 
-      <Box marginTop={1} flexDirection="column">
-        <Box>
-          <Text>    </Text>
-          <Text color={claude ? COLORS.ok : COLORS.err}>{claude ? '✓' : '×'}</Text>
-          <Text>  </Text>
-          <Box width={8}><Text color={providerHex('claude')}>claude</Text></Box>
-          <Text>  </Text>
-          {claude ? (
-            <Text dimColor>model {config.claude_model ?? 'claude-opus-4-7'}</Text>
-          ) : (
-            <Text dimColor>pj login claude</Text>
-          )}
-        </Box>
-        <Box>
-          <Text>    </Text>
-          <Text color={codex ? COLORS.ok : COLORS.err}>{codex ? '✓' : '×'}</Text>
-          <Text>  </Text>
-          <Box width={8}><Text color={providerHex('codex')}>codex</Text></Box>
-          <Text>  </Text>
-          {codex ? (
-            <>
-              <Text dimColor>model {config.codex_model ?? 'gpt-5.4'}</Text>
-              <Text dimColor>  ·  {codex.email}</Text>
-            </>
-          ) : (
-            <Text dimColor>pj login codex</Text>
-          )}
-        </Box>
-        <Box>
-          <Text>    </Text>
-          <Text color={oaiKey ? COLORS.ok : COLORS.err}>{oaiKey ? '✓' : '×'}</Text>
-          <Text>  </Text>
-          <Box width={8}><Text color={providerHex('oai')}>oai</Text></Box>
-          <Text>  </Text>
-          {oaiKey ? (
-            <>
-              <Text dimColor>model {getOAIModel()}</Text>
-              <Text dimColor>  ·  {getOAIDisplayName()}</Text>
-            </>
-          ) : (
-            <Text dimColor>pj config preset &lt;deepseek|kimi|glm|…&gt;</Text>
-          )}
-        </Box>
-      </Box>
-
-      <Box marginTop={1}>
-        <Text dimColor>  Type a task and press Enter. </Text>
+      {/* Outside the card: minimal help hint, single dim line */}
+      <Box marginTop={1} paddingX={1}>
+        <Text dimColor>Type a task, or </Text>
         <Text color={COLORS.accent}>/help</Text>
         <Text dimColor> for commands. </Text>
+        <Text color={COLORS.accent}>↑↓</Text>
+        <Text dimColor> history · </Text>
+        <Text color={COLORS.accent}>tab</Text>
+        <Text dimColor> complete · </Text>
         <Text color={COLORS.accent}>ctrl-c</Text>
-        <Text dimColor> to cancel, </Text>
+        <Text dimColor> cancel · </Text>
         <Text color={COLORS.accent}>ctrl-d</Text>
-        <Text dimColor> or </Text>
-        <Text color={COLORS.accent}>/exit</Text>
-        <Text dimColor> to quit.</Text>
+        <Text dimColor> exit</Text>
       </Box>
     </Box>
   )
 }
 
+function ProviderRow({
+  name,
+  ok,
+  detail,
+}: {
+  name: ProviderName
+  ok: boolean
+  detail: React.ReactNode
+}): JSX.Element {
+  return (
+    <Box>
+      <Text color={ok ? COLORS.ok : COLORS.err}>{ok ? '✓' : '×'}</Text>
+      <Text>  </Text>
+      <Box width={8}><Text color={providerHex(name)}>{name}</Text></Box>
+      <Text>  </Text>
+      {detail as any}
+    </Box>
+  )
+}
+
 // ── Input box ───────────────────────────────────────────────────────────────
+
+// ── Input box — Claude-Code-style (top+bottom horizontal rules only) ───────
+//
+// `borderStyle="round"` with `borderLeft={false} borderRight={false}` renders
+// only the two horizontal rules that frame the prompt row. The `›` prompt
+// glyph lives on the input line itself (not in the border, since vanilla
+// Ink doesn't support border-embedded text).
 
 function InputBox({
   value,
@@ -463,10 +509,26 @@ function InputBox({
   disabled: boolean
   placeholder?: string
 }): JSX.Element {
+  const color = disabled ? 'gray' : COLORS.accent
+  const { stdout } = useStdout()
+  const cols = stdout?.columns ?? 80
+  const width = Math.min(cols - 2, 88)
   return (
-    <Box flexDirection="column">
-      <Box borderStyle="round" borderColor={disabled ? 'gray' : COLORS.accent} paddingX={1}>
-        <Text color={disabled ? 'gray' : COLORS.accent}>› </Text>
+    <Box
+      flexDirection="row"
+      alignItems="flex-start"
+      justifyContent="flex-start"
+      borderStyle="round"
+      borderColor={color}
+      borderDimColor={disabled}
+      borderLeft={false}
+      borderRight={false}
+      paddingX={1}
+      width={width}
+    >
+      <Text color={color}>›</Text>
+      <Text> </Text>
+      <Box flexGrow={1}>
         {disabled ? (
           <Text dimColor>{placeholder ?? '(busy — ctrl-c to cancel)'}</Text>
         ) : (
@@ -1413,7 +1475,7 @@ function App(): JSX.Element {
   ]
 
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" paddingX={1}>
       <Static items={staticItems}>
         {(item, idx) => (
           <Box key={idx} flexDirection="column">
@@ -1434,15 +1496,17 @@ function App(): JSX.Element {
 
       {conversation.length > 0 && !debate.running && !debate.error ? (
         <Box marginTop={1}>
-          <Text dimColor>  thread: </Text>
+          <Text dimColor>thread · </Text>
           <Text color={COLORS.accent}>{conversation.length}</Text>
-          <Text dimColor>{conversation.length === 1 ? ' prior turn' : ' prior turns'}  ·  /new to reset</Text>
+          <Text dimColor>{conversation.length === 1 ? ' prior turn' : ' prior turns'}  ·  </Text>
+          <Text color={COLORS.accent}>/new</Text>
+          <Text dimColor> to reset</Text>
         </Box>
       ) : null}
 
       {suspended ? (
         <Box marginTop={1}>
-          <Text dimColor>  (oauth child process running — TUI resumes on exit)</Text>
+          <Text dimColor>oauth running — TUI resumes on child exit</Text>
         </Box>
       ) : null}
 
