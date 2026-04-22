@@ -5,14 +5,15 @@
  */
 
 import React, { useEffect, useReducer, useRef, useState } from 'react'
-import { Box, Static, Text, render, useApp, useInput } from 'ink'
+import { Box, Static, Text, render, useApp, useInput, useStdin } from 'ink'
 import TextInput from 'ink-text-input'
+import { spawn } from 'node:child_process'
 
 import { Orchestrator, type ProgressEvent } from '../orchestrator/index.js'
 import { ClaudeProvider } from '../providers/claude/index.js'
 import { CodexProvider } from '../providers/codex/index.js'
 import { OAIProvider } from '../providers/oai/index.js'
-import type { JudgeStrategy, ProviderName } from '../types.js'
+import type { ConversationTurn, JudgeStrategy, ProviderName } from '../types.js'
 import {
   applyOAIPreset,
   findOAIPreset,
@@ -509,6 +510,9 @@ interface CommandContext {
   setSession: (s: SessionConfig) => void
   addEntry: (e: TranscriptEntry) => void
   clearTranscript: () => void
+  clearConversation: () => void
+  conversationLength: number
+  requestLogin: (provider: 'claude' | 'codex') => void
   exit: () => void
 }
 
@@ -518,6 +522,148 @@ function noteText(lines: React.ReactNode[]): React.ReactNode {
       {lines.map((line, i) => <Box key={i}>{line as any}</Box>)}
     </>
   )
+}
+
+// ── Tab-completion ──────────────────────────────────────────────────────────
+
+const SLASH_COMMANDS = [
+  'help', 'status', 'thread',
+  'new', 'clear', 'reset',
+  'login',
+  'providers', 'judge', 'verbose',
+  'config', 'preset',
+  'exit', 'quit',
+] as const
+
+const CONFIG_SUBS = ['show', 'set', 'preset'] as const
+const JUDGE_VALUES = ['rotate', 'claude', 'codex', 'oai', 'vote'] as const
+const PROVIDER_VALUES = ['claude', 'codex', 'oai'] as const
+const LOGIN_VALUES = ['claude', 'codex'] as const
+const CONFIG_KEYS = [
+  'oai_api_key', 'oai_base_url', 'oai_model',
+  'oai_web_search', 'oai_agent', 'oai_display_name',
+  'claude_model', 'claude_web_search', 'claude_agent',
+  'codex_model', 'codex_web_search', 'codex_agent',
+  'default_judge',
+] as const
+
+interface CompletionResult {
+  /** If unique completion found, the full input to replace with. */
+  match?: string
+  /** If multiple candidates, the list to show. */
+  suggestions?: string[]
+}
+
+/**
+ * Expand a partial slash command to its best completion.
+ *
+ * Rules:
+ * - Single word starting with `/`  → complete command name.
+ * - `/config <partial>`            → complete subcommand (show | set | preset).
+ * - `/config preset <partial>` or `/preset <partial>`  → complete preset name.
+ * - `/config set <partial>`        → complete config key.
+ * - `/judge <partial>`             → complete strategy.
+ * - `/providers <partial>`        → complete the last comma-separated token.
+ * - `/login <partial>`            → complete claude | codex.
+ */
+export function completeSlash(input: string): CompletionResult {
+  if (!input.startsWith('/')) return {}
+  const trailingSpace = /\s$/.test(input)
+  const words = input.slice(1).trim().split(/\s+/).filter(Boolean)
+
+  // First-word completion: user is still typing the command name.
+  if (words.length <= 1 && !trailingSpace) {
+    const partial = words[0] ?? ''
+    return suggest(partial, [...SLASH_COMMANDS], p => `/${p}`, { space: true })
+  }
+
+  const head = words[0]
+
+  if (head === 'config') {
+    // /config <sub> ...
+    if (words.length === 1 || (words.length === 2 && !trailingSpace)) {
+      const partial = words[1] ?? ''
+      return suggest(partial, [...CONFIG_SUBS], p => `/config ${p}`, { space: true })
+    }
+    const sub = words[1]
+    if (sub === 'preset') {
+      const partial = trailingSpace && words.length === 2 ? '' : (words[2] ?? '')
+      return suggest(partial, OAI_PRESETS.map(p => p.name), p => `/config preset ${p}`)
+    }
+    if (sub === 'set') {
+      const partial = trailingSpace && words.length === 2 ? '' : (words[2] ?? '')
+      if (words.length <= 3) return suggest(partial, [...CONFIG_KEYS], p => `/config set ${p}`, { space: true })
+    }
+    return {}
+  }
+
+  if (head === 'preset') {
+    const partial = trailingSpace && words.length === 1 ? '' : (words[1] ?? '')
+    return suggest(partial, OAI_PRESETS.map(p => p.name), p => `/preset ${p}`)
+  }
+
+  if (head === 'judge') {
+    const partial = trailingSpace && words.length === 1 ? '' : (words[1] ?? '')
+    return suggest(partial, [...JUDGE_VALUES], p => `/judge ${p}`)
+  }
+
+  if (head === 'login') {
+    const partial = trailingSpace && words.length === 1 ? '' : (words[1] ?? '')
+    return suggest(partial, [...LOGIN_VALUES], p => `/login ${p}`)
+  }
+
+  if (head === 'providers') {
+    // Comma-separated. Complete just the last comma-token.
+    const rest = words.slice(1).join(' ') + (trailingSpace ? ' ' : '')
+    const parts = rest.split(',')
+    const last = (parts[parts.length - 1] ?? '').trimStart()
+    return suggest(
+      last,
+      [...PROVIDER_VALUES],
+      p => `/providers ${parts.slice(0, -1).concat([p]).join(',')}`,
+    )
+  }
+
+  return {}
+}
+
+/**
+ * Three-way result:
+ * - unique completion  → `{ match: <full line> }`
+ * - LCP-extensible     → `{ match: <full line with LCP>, suggestions: […candidates] }`
+ * - ambiguous at LCP   → `{ suggestions: […candidates] }`
+ *
+ * `opts.space` means "append a trailing space on a UNIQUE completion"
+ * (because another argument is expected). The LCP extension never gets
+ * a trailing space — you're still completing the same token.
+ */
+function suggest(
+  partial: string,
+  pool: string[],
+  build: (candidate: string) => string,
+  opts: { space?: boolean } = {},
+): CompletionResult {
+  const matches = pool.filter(p => p.startsWith(partial))
+  if (matches.length === 0) return {}
+  if (matches.length === 1) {
+    const full = build(matches[0]!)
+    return { match: opts.space ? full + ' ' : full }
+  }
+  const lcp = longestCommonPrefix(matches)
+  if (lcp.length > partial.length) return { match: build(lcp), suggestions: matches }
+  return { suggestions: matches }
+}
+
+function longestCommonPrefix(xs: string[]): string {
+  if (xs.length === 0) return ''
+  let prefix = xs[0]!
+  for (const s of xs.slice(1)) {
+    let i = 0
+    while (i < prefix.length && i < s.length && prefix[i] === s[i]) i++
+    prefix = prefix.slice(0, i)
+    if (!prefix) break
+  }
+  return prefix
 }
 
 function handleCommand(raw: string, ctx: CommandContext): void {
@@ -682,8 +828,43 @@ function handleCommand(raw: string, ctx: CommandContext): void {
     }
 
     case 'clear':
+    case 'new':
+    case 'reset':
+      // Synonymous: clear both the visible transcript and the semantic
+      // conversation thread, so the next task starts with a clean slate.
       ctx.clearTranscript()
+      ctx.clearConversation()
       return
+
+    case 'thread': {
+      const n = ctx.conversationLength
+      ctx.addEntry({
+        id: Date.now(),
+        kind: 'note',
+        content: (
+          <Text dimColor>
+            {'  thread: '}
+            <Text color={COLORS.accent}>{n}</Text>
+            {n === 1 ? ' prior turn' : ' prior turns'}
+            {n > 0 ? '  ·  /new to reset' : ''}
+          </Text>
+        ),
+      })
+      return
+    }
+
+    case 'login': {
+      if (!arg) {
+        ctx.addEntry({ id: Date.now(), kind: 'error', message: 'usage: /login claude | /login codex' })
+        return
+      }
+      if (arg !== 'claude' && arg !== 'codex') {
+        ctx.addEntry({ id: Date.now(), kind: 'error', message: `only claude and codex use OAuth. For oai, use /preset <name> then /config set oai_api_key <key>` })
+        return
+      }
+      ctx.requestLogin(arg)
+      return
+    }
 
     case 'exit':
     case 'quit':
@@ -704,9 +885,12 @@ function handleCommand(raw: string, ctx: CommandContext): void {
 
 function HelpView(): JSX.Element {
   const cmds: Array<[string, string]> = [
-    ['<task>',                   'run a three-model planning debate on the given task'],
+    ['<task>',                   'run a debate — follow-ups thread the prior plan as context'],
     ['/help',                    'show this help'],
     ['/status',                  'provider authentication and config status'],
+    ['/thread',                  'show how many prior turns are threaded as context'],
+    ['/new · /clear · /reset',   'start a fresh conversation thread and clear the transcript'],
+    ['/login <provider>',        'run OAuth for claude or codex without leaving the TUI'],
     ['/providers <csv>',         'set active providers for this session (e.g. claude,oai)'],
     ['/judge <strategy>',        'set judge: rotate | claude | codex | oai | vote'],
     ['/verbose [on|off]',        'toggle verbose mode'],
@@ -714,9 +898,10 @@ function HelpView(): JSX.Element {
     ['/config set <k> <v>',      'persist a config value'],
     ['/config preset [name]',    'list presets, or apply an OpenAI-compatible endpoint preset'],
     ['/preset <name>',           'shortcut for /config preset <name>'],
-    ['/clear',                   'clear the transcript'],
     ['/exit · /quit · ctrl-d',   'exit triptych'],
     ['ctrl-c',                   'cancel the current debate (keeps app running)'],
+    ['↑ · ↓',                    'browse prompt history'],
+    ['tab',                      'complete slash commands / preset names / judge / provider'],
   ]
   const w = Math.max(...cmds.map(([c]) => c.length))
   return (
@@ -836,18 +1021,34 @@ namespace nextId { export let counter = 0 }
 
 function App(): JSX.Element {
   const { exit } = useApp()
+  const { setRawMode } = useStdin()
   const [session, setSession] = useState<SessionConfig>(defaultSession)
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([])
   const [input, setInput] = useState('')
   const [debate, dispatch] = useReducer(debateReducer, INITIAL_DEBATE)
+
+  // Conversation thread — each accepted turn feeds into the next debate's
+  // R0/R1/R3/R4 prompts so follow-ups build on prior plans.
+  const [conversation, setConversation] = useState<ConversationTurn[]>([])
+
+  // Command history with up/down arrow navigation.
+  const [history, setHistory] = useState<string[]>([])
+  const historyIdx = useRef<number | null>(null)
+  const draft = useRef('')
+
+  // True while a spawned child (/login) owns stdio and Ink is suspended.
+  const [suspended, setSuspended] = useState(false)
 
   const acRef = useRef<AbortController | null>(null)
   const ctrlCPressedAt = useRef(0)
 
   const addEntry = (e: TranscriptEntry) => setTranscript(t => [...t, e])
   const clearTranscript = () => setTranscript([])
+  const clearConversation = () => setConversation([])
 
   useInput((inputChar, key) => {
+    if (suspended) return
+
     if (key.ctrl && inputChar === 'c') {
       if (debate.running && acRef.current) {
         acRef.current.abort()
@@ -866,9 +1067,73 @@ function App(): JSX.Element {
           })
         }
       }
+      return
     }
     if (key.ctrl && inputChar === 'd') {
       exit()
+      return
+    }
+
+    // History navigation — only while idle and when there's something to browse.
+    if (debate.running) return
+    if (key.upArrow) {
+      if (history.length === 0) return
+      if (historyIdx.current === null) {
+        draft.current = input
+        historyIdx.current = history.length - 1
+      } else if (historyIdx.current > 0) {
+        historyIdx.current -= 1
+      }
+      setInput(history[historyIdx.current]!)
+      return
+    }
+    if (key.downArrow) {
+      if (historyIdx.current === null) return
+      if (historyIdx.current < history.length - 1) {
+        historyIdx.current += 1
+        setInput(history[historyIdx.current]!)
+      } else {
+        historyIdx.current = null
+        setInput(draft.current)
+      }
+      return
+    }
+
+    // Tab completion — slash-prefixed input only (plain task text passes through).
+    if (key.tab) {
+      if (!input.startsWith('/')) return
+      const result = completeSlash(input)
+      // Fill the input with the longest unambiguous completion (unique or LCP).
+      if (result.match !== undefined && result.match !== input) {
+        setInput(result.match)
+        historyIdx.current = null
+      }
+      // Show candidates whenever more than one is possible — even when we also
+      // advanced the input, so the user sees what the remaining choices are.
+      if (result.suggestions && result.suggestions.length > 1) {
+        addEntry({
+          id: nextId(),
+          kind: 'note',
+          content: (
+            <Box>
+              <Text>  </Text>
+              {result.suggestions.map((s, i) => (
+                <React.Fragment key={i}>
+                  {i > 0 ? <Text dimColor>  ·  </Text> : null}
+                  <Text color={COLORS.accent}>{s}</Text>
+                </React.Fragment>
+              ))}
+            </Box>
+          ),
+        })
+      }
+      return
+    }
+
+    // Any keystroke other than up/down/tab abandons history browsing so the
+    // next up/down starts from a fresh "current draft" anchor.
+    if (historyIdx.current !== null && (inputChar || key.return || key.backspace || key.delete)) {
+      historyIdx.current = null
     }
   })
 
@@ -889,7 +1154,7 @@ function App(): JSX.Element {
         addEntry({
           id: nextId(),
           kind: 'error',
-          message: `${p} is not authenticated — ${p === 'oai' ? '/preset <name> then /config set oai_api_key <key>' : `run \`pj login ${p}\` outside the TUI`}`,
+          message: `${p} is not authenticated — ${p === 'oai' ? '/preset <name> then /config set oai_api_key <key>' : `/login ${p}`}`,
         })
         return
       }
@@ -906,6 +1171,10 @@ function App(): JSX.Element {
       judge: session.judge,
       verbose: session.verbose,
     })
+
+    // Snapshot conversation state at submit time; new turns get appended on
+    // successful completion.
+    const convoAtStart = conversation
 
     const onProgress = (event: ProgressEvent) => {
       switch (event.phase) {
@@ -1017,12 +1286,19 @@ function App(): JSX.Element {
     }
 
     try {
-      const result = await orchestrator.run({ task }, onProgress, ac.signal)
+      const result = await orchestrator.run(
+        { task, conversation: convoAtStart.length > 0 ? convoAtStart : undefined },
+        onProgress,
+        ac.signal,
+      )
       dispatch({
         type: 'finish',
         finalPlan: result.rounds.r4_judgment.finalPlan,
         judge: result.rounds.r4_judgment.judge,
       })
+      // Append this (task, finalPlan) to the conversation thread so the next
+      // debate sees it as prior context.
+      setConversation(prev => [...prev, { userTask: task, finalPlan: result.rounds.r4_judgment.finalPlan }])
       // Move the finished debate into the transcript as a single entry.
       addEntry({
         id: nextId(),
@@ -1045,10 +1321,67 @@ function App(): JSX.Element {
     }
   }
 
+  /**
+   * Suspend Ink (release raw mode, stop re-rendering), spawn `pj login
+   * <provider>` inheriting the parent terminal so the OAuth URL is visible
+   * and the callback listener can bind :1618 / :8976 without fighting Ink
+   * for stdin. Resume Ink after the child exits.
+   */
+  function runLogin(provider: 'claude' | 'codex'): void {
+    if (suspended) return
+    setSuspended(true)
+
+    // Release raw mode so the child can treat the terminal as a normal tty.
+    try { setRawMode(false) } catch { /* some test terms reject this */ }
+
+    // A tiny header so the user sees where the OAuth output starts. Written
+    // after Ink's last frame for this state; Ink will redraw a full frame on
+    // resume, pushing this into scrollback.
+    process.stdout.write(`\n  launching ${provider} oauth (browser)…\n\n`)
+
+    const child = spawn(
+      process.argv[0] ?? 'bun',
+      [process.argv[1] ?? 'src/cli.ts', 'login', provider],
+      { stdio: 'inherit' },
+    )
+
+    child.on('exit', (code) => {
+      try { setRawMode(true) } catch { /* see above */ }
+      setSuspended(false)
+      if (code === 0) {
+        addEntry({
+          id: nextId(),
+          kind: 'note',
+          content: (
+            <Text>
+              {'  '}<Text color={COLORS.ok}>✓</Text>{`  ${provider} authenticated`}
+            </Text>
+          ),
+        })
+      } else {
+        addEntry({
+          id: nextId(),
+          kind: 'error',
+          message: `${provider} login exited with code ${code}`,
+        })
+      }
+    })
+    child.on('error', (e) => {
+      try { setRawMode(true) } catch { /* see above */ }
+      setSuspended(false)
+      addEntry({ id: nextId(), kind: 'error', message: `login spawn failed: ${e.message}` })
+    })
+  }
+
   const onSubmit = (raw: string) => {
     const text = raw.trim()
     if (!text) return
     setInput('')
+    historyIdx.current = null
+
+    // Push to history (skip consecutive duplicates).
+    setHistory(h => (h[h.length - 1] === text ? h : [...h, text]))
+
     if (text.startsWith('/')) {
       addEntry({ id: nextId(), kind: 'prompt', text })
       handleCommand(text, {
@@ -1056,14 +1389,16 @@ function App(): JSX.Element {
         setSession,
         addEntry,
         clearTranscript,
+        clearConversation,
+        conversationLength: conversation.length,
+        requestLogin: runLogin,
         exit,
       })
       return
     }
-    // Task submission
-    // We don't add a transcript prompt entry here because the debate view
-    // itself shows the active task; on completion we add a consolidated
-    // debate entry.
+    // Task submission: the debate view already shows the active task, and
+    // on completion we add a consolidated debate entry — no separate prompt
+    // transcript entry here.
     void runDebate(text)
   }
 
@@ -1097,12 +1432,26 @@ function App(): JSX.Element {
         </Box>
       ) : null}
 
+      {conversation.length > 0 && !debate.running && !debate.error ? (
+        <Box marginTop={1}>
+          <Text dimColor>  thread: </Text>
+          <Text color={COLORS.accent}>{conversation.length}</Text>
+          <Text dimColor>{conversation.length === 1 ? ' prior turn' : ' prior turns'}  ·  /new to reset</Text>
+        </Box>
+      ) : null}
+
+      {suspended ? (
+        <Box marginTop={1}>
+          <Text dimColor>  (oauth child process running — TUI resumes on exit)</Text>
+        </Box>
+      ) : null}
+
       <Box marginTop={1}>
         <InputBox
           value={input}
           onChange={setInput}
           onSubmit={onSubmit}
-          disabled={debate.running}
+          disabled={debate.running || suspended}
           placeholder={debate.running ? '(running — ctrl-c to cancel)' : 'type a task or /help'}
         />
       </Box>

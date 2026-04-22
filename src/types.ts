@@ -1,7 +1,19 @@
+/**
+ * One accepted turn of an ongoing planning conversation. Each entry is a
+ * `(userTask, finalPlan)` pair produced by a previous full R0-R4 run. Threaded
+ * into R0/R1/R3/R4 prompts so follow-up tasks can refine or extend prior plans
+ * instead of starting from scratch.
+ */
+export interface ConversationTurn {
+  userTask: string
+  finalPlan: string
+}
+
 /** A planning request sent to all providers */
 export interface PlanRequest {
-  task: string          // 用户的原始任务描述
-  context?: string      // 可选的补充上下文
+  task: string                          // 用户的原始任务描述
+  context?: string                      // 可选的补充上下文
+  conversation?: ConversationTurn[]     // 前序 turn(s) — 用于 follow-up 模式
   maxTokens?: number
 }
 

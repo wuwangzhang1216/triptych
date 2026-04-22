@@ -1,8 +1,33 @@
-import type { CritiqueResult, FrameResult, PlanRequest, PlanResult, RevisionResult } from '../types.js'
+import type { ConversationTurn, CritiqueResult, FrameResult, PlanRequest, PlanResult, RevisionResult } from '../types.js'
 
 interface Prompt {
   system: string
   user: string
+}
+
+/**
+ * Prepend prior accepted (userTask, finalPlan) turns to the phase user
+ * message so multi-turn follow-ups have the plans that were adopted before.
+ * Returns empty string when no prior turns exist, so the non-follow-up path
+ * sees the original prompt unchanged.
+ *
+ * Only invoked for R0/R1/R3/R4. R2 critiques the specific R1 plan it's
+ * handed — conversation history would just dilute the critique focus.
+ */
+function priorConversationBlock(conversation?: ConversationTurn[]): string {
+  if (!conversation || conversation.length === 0) return ''
+  const body = conversation
+    .map((t, i) => `TURN ${i + 1} — user task:\n${t.userTask}\n\nTURN ${i + 1} — plan adopted:\n${t.finalPlan}`)
+    .join('\n\n---\n\n')
+  return `===== PRIOR CONVERSATION =====
+
+This is a multi-turn planning collaboration. The plans below were synthesized and accepted in earlier turns; the current task is a follow-up that may refine, extend, contradict, or redirect them. Treat them as the shared working context, not as fixed requirements — if the new task supersedes a prior decision, say so explicitly and adjust.
+
+${body}
+
+===== END PRIOR CONVERSATION =====
+
+`
 }
 
 // Shared behavioral baseline — applied to all phases.
@@ -41,7 +66,7 @@ Output with these exact top-level sections:
 **Success Criteria**: observable signals the task was solved. Be testable, not aspirational.
 **Known Tensions**: specific conflicts between stated requirements that force real architectural tradeoffs.`,
 
-    user: `Task: ${req.task}${req.context ? `\n\nAdditional Context:\n${req.context}` : ''}
+    user: `${priorConversationBlock(req.conversation)}Task: ${req.task}${req.context ? `\n\nAdditional Context:\n${req.context}` : ''}
 
 Produce your R0 task frame.`,
   }
@@ -74,7 +99,7 @@ Output structure:
 - **Risks & Mitigations**: top 3–5 risks ranked, each with (a) what goes wrong, (b) how you detect it, (c) how you mitigate.
 - **Success Criteria**: testable signals the plan succeeded.`,
 
-    user: `Task: ${req.task}${req.context ? `\n\nAdditional Context:\n${req.context}` : ''}${framesSection}
+    user: `${priorConversationBlock(req.conversation)}Task: ${req.task}${req.context ? `\n\nAdditional Context:\n${req.context}` : ''}${framesSection}
 
 Produce your R1 plan.`,
   }
@@ -143,7 +168,7 @@ Output structure:
 - **What Changed**: bullet list of substantive changes (not "polished wording").
 - **What I Defended**: bullet list of points kept despite critique, with the reason.`,
 
-    user: `Task: ${req.task}${req.context ? `\n\nContext:\n${req.context}` : ''}
+    user: `${priorConversationBlock(req.conversation)}Task: ${req.task}${req.context ? `\n\nContext:\n${req.context}` : ''}
 
 ---
 Your R1 plan:
@@ -209,7 +234,7 @@ High/Medium/Low, with a sentence on the residual risk. Low is an acceptable answ
 ## Final Plan
 The definitive plan. Use ### and deeper headings inside this section; never another ##. This MUST be the last top-level (##) section and MUST be a complete, self-contained plan — the reader will not see the sections above. Downstream tooling extracts from this heading to end-of-output.`,
 
-    user: `Task: ${req.task}${req.context ? `\n\nContext:\n${req.context}` : ''}
+    user: `${priorConversationBlock(req.conversation)}Task: ${req.task}${req.context ? `\n\nContext:\n${req.context}` : ''}
 
 ===== R1 INITIAL PLANS =====
 
