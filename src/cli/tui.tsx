@@ -670,6 +670,14 @@ export interface SuggestionItem {
   description?: string
 }
 
+// Top-level commands that require an argument after the name — fullLine
+// gets a trailing space so filling cascades straight into the next
+// completion layer (/l + Enter → /login ‹cursor› → dropdown offers claude|codex).
+const TOP_CMD_NEEDS_ARG = new Set(['login', 'providers', 'judge', 'config', 'preset'])
+
+// Same idea for /config <sub>: `set` and `preset` take further args.
+const CONFIG_SUB_NEEDS_ARG = new Set(['set', 'preset'])
+
 /**
  * Context-aware list of suggestions for the current input. Returns an empty
  * array when the input is not in a completable state.
@@ -685,7 +693,7 @@ export function getSuggestions(input: string): SuggestionItem[] {
     return filterPool(COMMAND_DEFS, partial).map(c => ({
       value: c.name,
       description: c.aliasOf ? `${c.description}` : c.description,
-      fullLine: `/${c.name}`,
+      fullLine: TOP_CMD_NEEDS_ARG.has(c.name) ? `/${c.name} ` : `/${c.name}`,
     }))
   }
 
@@ -697,7 +705,7 @@ export function getSuggestions(input: string): SuggestionItem[] {
       return filterPool(CONFIG_SUBS, partial).map(s => ({
         value: s.name,
         description: s.description,
-        fullLine: `/config ${s.name}`,
+        fullLine: CONFIG_SUB_NEEDS_ARG.has(s.name) ? `/config ${s.name} ` : `/config ${s.name}`,
       }))
     }
     const sub = words[1]
@@ -1558,6 +1566,21 @@ function App(): JSX.Element {
   }
 
   const onSubmit = (raw: string) => {
+    // Live dropdown: Enter fills the highlighted suggestion instead of
+    // submitting, unless the input already equals the selected fullLine
+    // (i.e. nothing left to complete on this token). This mirrors shell
+    // conventions: Enter on a visible menu = "take this option", not
+    // "run whatever I typed".
+    if (hasSuggestions) {
+      const chosen = suggestions[suggSelected]
+      if (chosen && chosen.fullLine !== raw) {
+        setInput(chosen.fullLine)
+        historyIdx.current = null
+        return
+      }
+      // input already matches the selection → fall through to submit
+    }
+
     const text = raw.trim()
     if (!text) return
     setInput('')
